@@ -384,9 +384,9 @@ impl Channel for GatewayChannel {
             Some(tid) => tid,
             None => {
                 tracing::warn!(
-                    "Gateway broadcast with no thread_id — event will be dropped by clients"
+                    "Gateway broadcast with no thread_id — skipping (clients would drop it)"
                 );
-                String::new()
+                return Ok(());
             }
         };
         self.state.sse.broadcast(SseEvent::Response {

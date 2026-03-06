@@ -474,7 +474,7 @@ pub async fn chat_threads_handler(
     }
 
     // Fallback: in-memory only (no assistant thread without DB)
-    let threads: Vec<ThreadInfo> = sess
+    let mut threads: Vec<ThreadInfo> = sess
         .threads
         .values()
         .map(|t| ThreadInfo {
@@ -488,6 +488,7 @@ pub async fn chat_threads_handler(
             channel: Some("gateway".to_string()),
         })
         .collect();
+    threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
     Ok(Json(ThreadListResponse {
         assistant_thread: None,

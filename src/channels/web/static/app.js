@@ -14,6 +14,7 @@ let jobEvents = new Map(); // job_id -> Array of events
 let jobListRefreshTimer = null;
 let pairingPollInterval = null;
 let unreadThreads = new Map(); // thread_id -> unread count
+let _loadThreadsTimer = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 
@@ -277,7 +278,7 @@ function connectSSE() {
     if (!isCurrentThread(data.thread_id)) {
       if (data.thread_id) {
         unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
-        loadThreads();
+        debouncedLoadThreads();
       }
       return;
     }
@@ -421,7 +422,7 @@ function connectSSE() {
 }
 
 // Check if an SSE event belongs to the currently viewed thread.
-// Events without a thread_id (legacy) are always shown.
+// Events without a thread_id are dropped (prevents notification leaking).
 function isCurrentThread(threadId) {
   if (!threadId) return false;
   if (!currentThreadId) return true;
@@ -1286,6 +1287,11 @@ function relativeTime(isoStr) {
 
 function isReadOnlyChannel(channel) {
   return channel && channel !== 'gateway' && channel !== 'routine' && channel !== 'heartbeat';
+}
+
+function debouncedLoadThreads() {
+  if (_loadThreadsTimer) clearTimeout(_loadThreadsTimer);
+  _loadThreadsTimer = setTimeout(() => { _loadThreadsTimer = null; loadThreads(); }, 500);
 }
 
 function loadThreads() {

@@ -380,7 +380,15 @@ impl Channel for GatewayChannel {
         _user_id: &str,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
-        let thread_id = response.thread_id.unwrap_or_default();
+        let thread_id = match response.thread_id {
+            Some(tid) => tid,
+            None => {
+                tracing::warn!(
+                    "Gateway broadcast with no thread_id — event will be dropped by clients"
+                );
+                String::new()
+            }
+        };
         self.state.sse.broadcast(SseEvent::Response {
             content: response.content,
             thread_id,

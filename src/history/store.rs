@@ -1525,7 +1525,8 @@ impl Store {
     /// Get or create a persistent conversation for a routine.
     ///
     /// Looks for a conversation where `metadata->>'routine_id' = routine_id`.
-    /// Creates one if it doesn't exist.
+    /// Creates one if it doesn't exist. Uses INSERT ON CONFLICT to avoid
+    /// TOCTOU races under concurrent routine executions.
     pub async fn get_or_create_routine_conversation(
         &self,
         routine_id: Uuid,
@@ -1535,8 +1536,27 @@ impl Store {
         let conn = self.conn().await?;
         let rid = routine_id.to_string();
 
+        // Attempt insert first; the partial unique index
+        // uq_conv_routine(user_id, (metadata->>'routine_id')) prevents duplicates.
+        let new_id = Uuid::new_v4();
+        let metadata = serde_json::json!({
+            "thread_type": "routine",
+            "routine_id": routine_id.to_string(),
+            "routine_name": routine_name,
+        });
+        conn.execute(
+            r#"
+            INSERT INTO conversations (id, channel, user_id, metadata)
+            VALUES ($1, 'routine', $2, $3)
+            ON CONFLICT ON CONSTRAINT uq_conv_routine DO NOTHING
+            "#,
+            &[&new_id, &user_id, &metadata],
+        )
+        .await?;
+
+        // Select back — always returns the winner.
         let row = conn
-            .query_opt(
+            .query_one(
                 r#"
                 SELECT id FROM conversations
                 WHERE user_id = $1 AND metadata->>'routine_id' = $2
@@ -1546,37 +1566,39 @@ impl Store {
             )
             .await?;
 
-        if let Some(row) = row {
-            return Ok(row.get("id"));
-        }
-
-        let id = Uuid::new_v4();
-        let metadata = serde_json::json!({
-            "thread_type": "routine",
-            "routine_id": routine_id.to_string(),
-            "routine_name": routine_name,
-        });
-        conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES ($1, $2, $3, $4)",
-            &[&id, &"routine", &user_id, &metadata],
-        )
-        .await?;
-
-        Ok(id)
+        Ok(row.get("id"))
     }
 
     /// Get or create the singleton heartbeat conversation for a user.
     ///
     /// Looks for a conversation where `metadata->>'thread_type' = 'heartbeat'`.
-    /// Creates one if it doesn't exist.
+    /// Creates one if it doesn't exist. Uses INSERT ON CONFLICT to avoid
+    /// TOCTOU races under concurrent heartbeat sends.
     pub async fn get_or_create_heartbeat_conversation(
         &self,
         user_id: &str,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.conn().await?;
 
+        // Attempt insert; the partial unique index
+        // uq_conv_heartbeat(user_id) prevents duplicates.
+        let new_id = Uuid::new_v4();
+        let metadata = serde_json::json!({
+            "thread_type": "heartbeat",
+        });
+        conn.execute(
+            r#"
+            INSERT INTO conversations (id, channel, user_id, metadata)
+            VALUES ($1, 'heartbeat', $2, $3)
+            ON CONFLICT ON CONSTRAINT uq_conv_heartbeat DO NOTHING
+            "#,
+            &[&new_id, &user_id, &metadata],
+        )
+        .await?;
+
+        // Select back — always returns the winner.
         let row = conn
-            .query_opt(
+            .query_one(
                 r#"
                 SELECT id FROM conversations
                 WHERE user_id = $1 AND metadata->>'thread_type' = 'heartbeat'
@@ -1586,21 +1608,7 @@ impl Store {
             )
             .await?;
 
-        if let Some(row) = row {
-            return Ok(row.get("id"));
-        }
-
-        let id = Uuid::new_v4();
-        let metadata = serde_json::json!({
-            "thread_type": "heartbeat",
-        });
-        conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES ($1, $2, $3, $4)",
-            &[&id, &"heartbeat", &user_id, &metadata],
-        )
-        .await?;
-
-        Ok(id)
+        Ok(row.get("id"))
     }
 
     /// Get or create the singleton "assistant" conversation for a user+channel.

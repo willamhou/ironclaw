@@ -203,6 +203,8 @@ impl ConversationStore for LibSqlBackend {
         Ok(results)
     }
 
+    /// Uses BEGIN IMMEDIATE to serialize concurrent writers and prevent
+    /// duplicate routine conversations (TOCTOU race).
     async fn get_or_create_routine_conversation(
         &self,
         routine_id: Uuid,
@@ -212,82 +214,122 @@ impl ConversationStore for LibSqlBackend {
         let conn = self.connect().await?;
         let rid = routine_id.to_string();
 
-        let mut rows = conn
-            .query(
-                r#"
-                SELECT id FROM conversations
-                WHERE user_id = ?1 AND json_extract(metadata, '$.routine_id') = ?2
-                LIMIT 1
-                "#,
-                params![user_id, rid],
-            )
+        conn.execute("BEGIN IMMEDIATE", params![])
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?
-        {
-            let id_str: String = row.get(0).unwrap_or_default();
-            return id_str
-                .parse()
-                .map_err(|_| DatabaseError::Serialization("Invalid UUID".to_string()));
-        }
+        let result: Result<Uuid, DatabaseError> = async {
+            let mut rows = conn
+                .query(
+                    r#"
+                    SELECT id FROM conversations
+                    WHERE user_id = ?1 AND json_extract(metadata, '$.routine_id') = ?2
+                    LIMIT 1
+                    "#,
+                    params![user_id, rid],
+                )
+                .await
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        let id = Uuid::new_v4();
-        let metadata = serde_json::json!({
-            "thread_type": "routine",
-            "routine_id": routine_id.to_string(),
-            "routine_name": routine_name,
-        });
-        conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), "routine", user_id, metadata.to_string()],
-        )
-        .await
-        .map_err(|e| DatabaseError::Query(e.to_string()))?;
-        Ok(id)
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| DatabaseError::Query(e.to_string()))?
+            {
+                let id_str: String = row.get(0).unwrap_or_default();
+                return id_str
+                    .parse()
+                    .map_err(|_| DatabaseError::Serialization("Invalid UUID".to_string()));
+            }
+
+            let id = Uuid::new_v4();
+            let metadata = serde_json::json!({
+                "thread_type": "routine",
+                "routine_id": routine_id.to_string(),
+                "routine_name": routine_name,
+            });
+            conn.execute(
+                "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
+                params![id.to_string(), "routine", user_id, metadata.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            Ok(id)
+        }
+        .await;
+
+        match &result {
+            Ok(_) => {
+                conn.execute("COMMIT", params![])
+                    .await
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            }
+            Err(_) => {
+                let _ = conn.execute("ROLLBACK", params![]).await;
+            }
+        }
+        result
     }
 
+    /// Uses BEGIN IMMEDIATE to serialize concurrent writers and prevent
+    /// duplicate heartbeat conversations (TOCTOU race).
     async fn get_or_create_heartbeat_conversation(
         &self,
         user_id: &str,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.connect().await?;
 
-        let mut rows = conn
-            .query(
-                r#"
-                SELECT id FROM conversations
-                WHERE user_id = ?1 AND json_extract(metadata, '$.thread_type') = 'heartbeat'
-                LIMIT 1
-                "#,
-                params![user_id],
-            )
+        conn.execute("BEGIN IMMEDIATE", params![])
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?
-        {
-            let id_str: String = row.get(0).unwrap_or_default();
-            return id_str
-                .parse()
-                .map_err(|_| DatabaseError::Serialization("Invalid UUID".to_string()));
-        }
+        let result: Result<Uuid, DatabaseError> = async {
+            let mut rows = conn
+                .query(
+                    r#"
+                    SELECT id FROM conversations
+                    WHERE user_id = ?1 AND json_extract(metadata, '$.thread_type') = 'heartbeat'
+                    LIMIT 1
+                    "#,
+                    params![user_id],
+                )
+                .await
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        let id = Uuid::new_v4();
-        let metadata = serde_json::json!({ "thread_type": "heartbeat" });
-        conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), "heartbeat", user_id, metadata.to_string()],
-        )
-        .await
-        .map_err(|e| DatabaseError::Query(e.to_string()))?;
-        Ok(id)
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| DatabaseError::Query(e.to_string()))?
+            {
+                let id_str: String = row.get(0).unwrap_or_default();
+                return id_str
+                    .parse()
+                    .map_err(|_| DatabaseError::Serialization("Invalid UUID".to_string()));
+            }
+
+            let id = Uuid::new_v4();
+            let metadata = serde_json::json!({ "thread_type": "heartbeat" });
+            conn.execute(
+                "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
+                params![id.to_string(), "heartbeat", user_id, metadata.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            Ok(id)
+        }
+        .await;
+
+        match &result {
+            Ok(_) => {
+                conn.execute("COMMIT", params![])
+                    .await
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            }
+            Err(_) => {
+                let _ = conn.execute("ROLLBACK", params![]).await;
+            }
+        }
+        result
     }
 
     async fn get_or_create_assistant_conversation(

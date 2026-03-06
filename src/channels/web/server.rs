@@ -1037,7 +1037,7 @@ async fn chat_threads_handler(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         if let Ok(summaries) = store
-            .list_conversations_with_preview(&state.user_id, "gateway", 50)
+            .list_conversations_all_channels(&state.user_id, 50)
             .await
         {
             let mut assistant_thread = None;
@@ -1052,6 +1052,7 @@ async fn chat_threads_handler(
                     updated_at: s.last_activity.to_rfc3339(),
                     title: s.title.clone(),
                     thread_type: s.thread_type.clone(),
+                    channel: Some(s.channel.clone()),
                 };
 
                 if s.id == assistant_id {
@@ -1071,6 +1072,7 @@ async fn chat_threads_handler(
                     updated_at: chrono::Utc::now().to_rfc3339(),
                     title: None,
                     thread_type: Some("assistant".to_string()),
+                    channel: Some("gateway".to_string()),
                 });
             }
 
@@ -1094,6 +1096,7 @@ async fn chat_threads_handler(
             updated_at: t.updated_at.to_rfc3339(),
             title: None,
             thread_type: None,
+            channel: Some("gateway".to_string()),
         })
         .collect();
 
@@ -1124,6 +1127,7 @@ async fn chat_new_thread_handler(
         updated_at: thread.updated_at.to_rfc3339(),
         title: None,
         thread_type: Some("thread".to_string()),
+        channel: Some("gateway".to_string()),
     };
 
     // Persist the empty conversation row with thread_type metadata

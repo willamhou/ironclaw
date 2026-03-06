@@ -380,6 +380,33 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         tracing::error!(routine = %routine.name, "Failed to update runtime state: {}", e);
     }
 
+    // Persist routine result to its dedicated conversation thread
+    let thread_id = match ctx
+        .store
+        .get_or_create_routine_conversation(routine.id, &routine.name, &routine.user_id)
+        .await
+    {
+        Ok(conv_id) => {
+            // Record the run result as a conversation message
+            let msg = match (&summary, status) {
+                (Some(s), _) => format!("[{}] {}: {}", run.trigger_type, status, s),
+                (None, _) => format!("[{}] {}", run.trigger_type, status),
+            };
+            if let Err(e) = ctx
+                .store
+                .add_conversation_message(conv_id, "assistant", &msg)
+                .await
+            {
+                tracing::error!(routine = %routine.name, "Failed to persist routine message: {}", e);
+            }
+            Some(conv_id.to_string())
+        }
+        Err(e) => {
+            tracing::error!(routine = %routine.name, "Failed to get routine conversation: {}", e);
+            None
+        }
+    };
+
     // Send notifications based on config
     send_notification(
         &ctx.notify_tx,
@@ -387,6 +414,7 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         &routine.name,
         status,
         summary.as_deref(),
+        thread_id.as_deref(),
     )
     .await;
 }
@@ -573,6 +601,7 @@ async fn send_notification(
     routine_name: &str,
     status: RunStatus,
     summary: Option<&str>,
+    thread_id: Option<&str>,
 ) {
     let should_notify = match status {
         RunStatus::Ok => notify.on_success,
@@ -599,7 +628,7 @@ async fn send_notification(
 
     let response = OutgoingResponse {
         content: message,
-        thread_id: None,
+        thread_id: thread_id.map(String::from),
         attachments: Vec::new(),
         metadata: serde_json::json!({
             "source": "routine",

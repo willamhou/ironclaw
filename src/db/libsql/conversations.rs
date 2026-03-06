@@ -97,6 +97,7 @@ impl ConversationStore for LibSqlBackend {
                     c.started_at,
                     c.last_activity,
                     c.metadata,
+                    c.channel,
                     (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id AND m.role = 'user') AS message_count,
                     (SELECT substr(m2.content, 1, 100)
                      FROM conversation_messages m2
@@ -133,12 +134,160 @@ impl ConversationStore for LibSqlBackend {
                     .unwrap_or_default(),
                 started_at: get_ts(&row, 1),
                 last_activity: get_ts(&row, 2),
-                message_count: get_i64(&row, 4),
-                title: get_opt_text(&row, 5),
+                message_count: get_i64(&row, 5),
+                title: get_opt_text(&row, 6),
                 thread_type,
+                channel: get_text(&row, 4),
             });
         }
         Ok(results)
+    }
+
+    async fn list_conversations_all_channels(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<ConversationSummary>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    c.id,
+                    c.started_at,
+                    c.last_activity,
+                    c.metadata,
+                    c.channel,
+                    (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id AND m.role = 'user') AS message_count,
+                    (SELECT substr(m2.content, 1, 100)
+                     FROM conversation_messages m2
+                     WHERE m2.conversation_id = c.id AND m2.role = 'user'
+                     ORDER BY m2.created_at ASC, m2.rowid ASC
+                     LIMIT 1
+                    ) AS title
+                FROM conversations c
+                WHERE c.user_id = ?1
+                ORDER BY c.last_activity DESC
+                LIMIT ?2
+                "#,
+                params![user_id, limit],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let metadata = get_json(&row, 3);
+            let thread_type = metadata
+                .get("thread_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            results.push(ConversationSummary {
+                id: row
+                    .get::<String>(0)
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap_or_default(),
+                started_at: get_ts(&row, 1),
+                last_activity: get_ts(&row, 2),
+                message_count: get_i64(&row, 5),
+                title: get_opt_text(&row, 6),
+                thread_type,
+                channel: get_text(&row, 4),
+            });
+        }
+        Ok(results)
+    }
+
+    async fn get_or_create_routine_conversation(
+        &self,
+        routine_id: Uuid,
+        routine_name: &str,
+        user_id: &str,
+    ) -> Result<Uuid, DatabaseError> {
+        let conn = self.connect().await?;
+        let rid = routine_id.to_string();
+
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT id FROM conversations
+                WHERE user_id = ?1 AND json_extract(metadata, '$.routine_id') = ?2
+                LIMIT 1
+                "#,
+                params![user_id, rid],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let id_str: String = row.get(0).unwrap_or_default();
+            return id_str
+                .parse()
+                .map_err(|_| DatabaseError::Serialization("Invalid UUID".to_string()));
+        }
+
+        let id = Uuid::new_v4();
+        let metadata = serde_json::json!({
+            "thread_type": "routine",
+            "routine_id": routine_id.to_string(),
+            "routine_name": routine_name,
+        });
+        conn.execute(
+            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
+            params![id.to_string(), "routine", user_id, metadata.to_string()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(id)
+    }
+
+    async fn get_or_create_heartbeat_conversation(
+        &self,
+        user_id: &str,
+    ) -> Result<Uuid, DatabaseError> {
+        let conn = self.connect().await?;
+
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT id FROM conversations
+                WHERE user_id = ?1 AND json_extract(metadata, '$.thread_type') = 'heartbeat'
+                LIMIT 1
+                "#,
+                params![user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let id_str: String = row.get(0).unwrap_or_default();
+            return id_str
+                .parse()
+                .map_err(|_| DatabaseError::Serialization("Invalid UUID".to_string()));
+        }
+
+        let id = Uuid::new_v4();
+        let metadata = serde_json::json!({ "thread_type": "heartbeat" });
+        conn.execute(
+            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
+            params![id.to_string(), "heartbeat", user_id, metadata.to_string()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(id)
     }
 
     async fn get_or_create_assistant_conversation(

@@ -380,9 +380,10 @@ impl Channel for GatewayChannel {
         _user_id: &str,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
+        let thread_id = response.thread_id.unwrap_or_default();
         self.state.sse.broadcast(SseEvent::Response {
             content: response.content,
-            thread_id: String::new(),
+            thread_id,
         });
         Ok(())
     }

@@ -441,6 +441,7 @@ pub async fn chat_threads_handler(
                     updated_at: s.last_activity.to_rfc3339(),
                     title: s.title.clone(),
                     thread_type: s.thread_type.clone(),
+                    channel: Some(s.channel.clone()),
                 };
 
                 if s.id == assistant_id {
@@ -460,6 +461,7 @@ pub async fn chat_threads_handler(
                     updated_at: chrono::Utc::now().to_rfc3339(),
                     title: None,
                     thread_type: Some("assistant".to_string()),
+                    channel: Some("gateway".to_string()),
                 });
             }
 
@@ -483,6 +485,7 @@ pub async fn chat_threads_handler(
             updated_at: t.updated_at.to_rfc3339(),
             title: None,
             thread_type: None,
+            channel: Some("gateway".to_string()),
         })
         .collect();
 
@@ -513,6 +516,7 @@ pub async fn chat_new_thread_handler(
         updated_at: thread.updated_at.to_rfc3339(),
         title: None,
         thread_type: Some("thread".to_string()),
+        channel: Some("gateway".to_string()),
     };
 
     // Persist the empty conversation row with thread_type metadata

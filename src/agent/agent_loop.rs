@@ -389,6 +389,7 @@ impl Agent {
                         self.cheap_llm().clone(),
                         self.safety().clone(),
                         Some(notify_tx),
+                        self.store().map(Arc::clone),
                     ))
                 } else {
                     tracing::warn!("Heartbeat enabled but no workspace available");

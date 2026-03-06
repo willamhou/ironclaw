@@ -898,7 +898,7 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-fn download_voice_file(file_id: &str) -> Result<Vec<u8>, String> {
+fn download_telegram_file(file_id: &str) -> Result<Vec<u8>, String> {
     // Reject file_id containing curly braces to prevent credential placeholder injection
     if file_id.contains('{') || file_id.contains('}') {
         return Err("invalid file_id: contains forbidden characters".to_string());
@@ -1508,7 +1508,7 @@ fn download_and_store_voice(attachments: &[InboundAttachment]) {
             continue;
         }
 
-        match download_voice_file(&att.id) {
+        match download_telegram_file(&att.id) {
             Ok(bytes) => {
                 channel_host::log(
                     channel_host::LogLevel::Info,
@@ -1531,6 +1531,64 @@ fn download_and_store_voice(attachments: &[InboundAttachment]) {
     }
 }
 
+/// Returns true if the attachment should be downloaded for document text extraction.
+///
+/// Excludes voice (handled by transcription), image (vision pipeline),
+/// audio (transcription), and video attachments.
+fn is_downloadable_document(att: &InboundAttachment) -> bool {
+    let is_voice = att
+        .filename
+        .as_ref()
+        .is_some_and(|f| f.starts_with("voice_"));
+    if is_voice {
+        return false;
+    }
+    if att.mime_type.starts_with("image/")
+        || att.mime_type.starts_with("audio/")
+        || att.mime_type.starts_with("video/")
+    {
+        return false;
+    }
+    true
+}
+
+/// Download document file bytes and store them via the host for text extraction.
+///
+/// Downloads any attachment that isn't voice or image so the host-side
+/// `DocumentExtractionMiddleware` can extract text from PDFs, Office docs, etc.
+fn download_and_store_documents(attachments: &[InboundAttachment]) {
+    for att in attachments {
+        if !is_downloadable_document(att) {
+            continue;
+        }
+
+        match download_telegram_file(&att.id) {
+            Ok(bytes) => {
+                channel_host::log(
+                    channel_host::LogLevel::Info,
+                    &format!(
+                        "Downloaded document file: {} bytes, mime={}",
+                        bytes.len(),
+                        att.mime_type
+                    ),
+                );
+                if let Err(e) = channel_host::store_attachment_data(&att.id, &bytes) {
+                    channel_host::log(
+                        channel_host::LogLevel::Error,
+                        &format!("Failed to store document data: {}", e),
+                    );
+                }
+            }
+            Err(e) => {
+                channel_host::log(
+                    channel_host::LogLevel::Error,
+                    &format!("Failed to download document file: {}", e),
+                );
+            }
+        }
+    }
+}
+
 /// Process a single message.
 fn handle_message(message: TelegramMessage) {
     // Extract attachments from media fields (pure data mapping, no host calls)
@@ -1538,6 +1596,9 @@ fn handle_message(message: TelegramMessage) {
 
     // Download and store voice attachments for host-side transcription
     download_and_store_voice(&attachments);
+
+    // Download and store document attachments for host-side text extraction
+    download_and_store_documents(&attachments);
 
     // Use text or caption (for media messages)
     let has_voice = message.voice.is_some();
@@ -2504,5 +2565,33 @@ mod tests {
         let attachments = extract_attachments(&msg);
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].id, "ph1");
+    }
+
+    #[test]
+    fn test_is_downloadable_document() {
+        let make = |mime: &str, filename: Option<&str>| InboundAttachment {
+            id: "test".to_string(),
+            mime_type: mime.to_string(),
+            filename: filename.map(|s| s.to_string()),
+            size_bytes: Some(1024),
+            source_url: None,
+            storage_key: None,
+            extracted_text: None,
+            extras_json: String::new(),
+        };
+
+        // PDFs and Office docs should be downloaded
+        assert!(is_downloadable_document(&make("application/pdf", Some("report.pdf"))));
+        assert!(is_downloadable_document(&make(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            Some("doc.docx"),
+        )));
+        assert!(is_downloadable_document(&make("text/plain", Some("notes.txt"))));
+
+        // Voice, image, audio, video should NOT be downloaded
+        assert!(!is_downloadable_document(&make("audio/ogg", Some("voice_123.ogg"))));
+        assert!(!is_downloadable_document(&make("image/jpeg", None)));
+        assert!(!is_downloadable_document(&make("audio/mpeg", Some("song.mp3"))));
+        assert!(!is_downloadable_document(&make("video/mp4", Some("clip.mp4"))));
     }
 }

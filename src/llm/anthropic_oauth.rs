@@ -113,7 +113,10 @@ impl AnthropicOAuthProvider {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(std::time::Duration::from_secs);
 
-            let response_text = response.text().await.unwrap_or_default();
+            let response_text = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("(failed to read error body: {e})"));
 
             if status.as_u16() == 401 {
                 return Err(LlmError::AuthFailed {

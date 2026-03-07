@@ -1073,6 +1073,13 @@ impl SetupWizard {
 
     /// Save an Anthropic OAuth token to secrets and set env for immediate use.
     async fn save_anthropic_oauth_token(&mut self, token: &str) -> Result<(), SetupError> {
+        // Validate token format to catch accidentally pasted API keys
+        if !token.starts_with("sk-ant-oat") {
+            print_error("Token doesn't look like an OAuth token (expected prefix: sk-ant-oat).");
+            print_info("If you have an API key instead, use the 'Direct API Key' option.");
+            return Err(SetupError::Config("Invalid OAuth token format".to_string()));
+        }
+
         // Store in secrets if available
         if let Ok(ctx) = self.init_secrets_context().await {
             let key = SecretString::from(token.to_string());
@@ -2311,7 +2318,6 @@ impl SetupWizard {
         {
             env_vars.push(("NEARAI_API_KEY".to_string(), api_key));
         }
-
 
         // Always write ONBOARD_COMPLETED so that check_onboard_needed()
         // (which runs before the DB is connected) knows to skip re-onboarding.

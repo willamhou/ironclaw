@@ -12,7 +12,7 @@ mod extractors;
 
 use crate::channels::{AttachmentKind, IncomingMessage};
 
-/// Maximum document size to download/extract (10 MB).
+/// Maximum document size to extract (10 MB).
 const MAX_DOCUMENT_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Maximum extracted text length to keep (100K chars ≈ ~25K tokens).
@@ -20,10 +20,12 @@ const MAX_EXTRACTED_TEXT_LEN: usize = 100_000;
 
 /// Middleware that processes document attachments on incoming messages.
 ///
-/// For each document attachment, attempts to:
-/// 1. Download bytes from `source_url` if `data` is empty
-/// 2. Extract text based on MIME type
-/// 3. Set `extracted_text` on the attachment
+/// For each document attachment with inline data, attempts to:
+/// 1. Extract text based on MIME type
+/// 2. Set `extracted_text` on the attachment
+///
+/// Downloading from `source_url` is intentionally not supported to prevent SSRF.
+/// Channels must populate `attachment.data` via `store_attachment_data`.
 #[derive(Default)]
 pub struct DocumentExtractionMiddleware;
 
@@ -71,7 +73,7 @@ impl DocumentExtractionMiddleware {
             } else {
                 extractions.push((
                     i,
-                    "[Document has no data and no download URL. \
+                    "[Document has no inline data. \
                      Please try sending the file again.]"
                         .to_string(),
                 ));

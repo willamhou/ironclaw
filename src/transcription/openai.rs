@@ -20,10 +20,18 @@ impl OpenAiWhisperProvider {
     /// Create a new Whisper provider with the given API key.
     pub fn new(api_key: SecretString) -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
-                .unwrap_or_default(),
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to build HTTP client with timeout, falling back to default: {e}"
+                    );
+                    reqwest::Client::default()
+                }
+            },
             api_key,
             model: "whisper-1".to_string(),
             base_url: "https://api.openai.com".to_string(),

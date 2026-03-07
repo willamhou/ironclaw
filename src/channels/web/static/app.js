@@ -296,7 +296,10 @@ function connectSSE() {
 
   eventSource.addEventListener('thinking', (e) => {
     const data = JSON.parse(e.data);
-    if (!isCurrentThread(data.thread_id)) return;
+    if (!isCurrentThread(data.thread_id)) {
+      if (data.thread_id) debouncedLoadThreads();
+      return;
+    }
     showActivityThinking(data.message);
   });
 
@@ -332,7 +335,10 @@ function connectSSE() {
 
   eventSource.addEventListener('status', (e) => {
     const data = JSON.parse(e.data);
-    if (!isCurrentThread(data.thread_id)) return;
+    if (!isCurrentThread(data.thread_id)) {
+      if (data.thread_id) debouncedLoadThreads();
+      return;
+    }
     // "Done" and "Awaiting approval" are terminal signals from the agent:
     // the agentic loop finished, so re-enable input as a safety net in case
     // the response SSE event is empty or lost.
@@ -454,7 +460,13 @@ function sendMessage() {
 }
 
 function enableChatInput() {
-  // no-op: input and send button are always enabled
+  const input = document.getElementById('chat-input');
+  const btn = document.getElementById('send-btn');
+  if (input) {
+    input.disabled = false;
+    input.placeholder = 'Message or / for commands...';
+  }
+  if (btn) btn.disabled = false;
 }
 
 // --- Slash Autocomplete ---
@@ -1268,7 +1280,7 @@ function threadTitle(thread) {
   if (thread.title) return thread.title;
   const ch = thread.channel || 'gateway';
   if (thread.thread_type === 'heartbeat') return 'Heartbeat Alerts';
-  if (thread.thread_type === 'routine') return 'Routine: ' + thread.id.substring(0, 8);
+  if (thread.thread_type === 'routine') return 'Routine';
   if (ch !== 'gateway') return ch.charAt(0).toUpperCase() + ch.slice(1);
   if (thread.turn_count === 0) return 'New chat';
   return thread.id.substring(0, 8);
@@ -1374,7 +1386,7 @@ function loadThreads() {
 
 function disableChatInputReadOnly() {
   const input = document.getElementById('chat-input');
-  const btn = document.getElementById('chat-send');
+  const btn = document.getElementById('send-btn');
   if (input) {
     input.disabled = true;
     input.placeholder = 'Read-only thread (external channel)';

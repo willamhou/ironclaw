@@ -1456,9 +1456,16 @@ impl Store {
                     .get("thread_type")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                let sql_title: Option<String> = r.get("title");
+                let title = sql_title.or_else(|| {
+                    metadata
+                        .get("routine_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
                 ConversationSummary {
                     id: r.get("id"),
-                    title: r.get("title"),
+                    title,
                     message_count: r.get("message_count"),
                     started_at: r.get("started_at"),
                     last_activity: r.get("last_activity"),
@@ -1509,9 +1516,18 @@ impl Store {
                     .get("thread_type")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                // For routine/heartbeat threads, derive title from metadata
+                // since they may have no user messages.
+                let sql_title: Option<String> = r.get("title");
+                let title = sql_title.or_else(|| {
+                    metadata
+                        .get("routine_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
                 ConversationSummary {
                     id: r.get("id"),
-                    title: r.get("title"),
+                    title,
                     message_count: r.get("message_count"),
                     started_at: r.get("started_at"),
                     last_activity: r.get("last_activity"),

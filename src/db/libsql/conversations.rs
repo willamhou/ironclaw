@@ -20,9 +20,10 @@ impl ConversationStore for LibSqlBackend {
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.connect().await?;
         let id = Uuid::new_v4();
+        let now = fmt_ts(&Utc::now());
         conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, thread_id) VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), channel, user_id, opt_text(thread_id)],
+            "INSERT INTO conversations (id, channel, user_id, thread_id, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id.to_string(), channel, user_id, opt_text(thread_id), now],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -71,8 +72,8 @@ impl ConversationStore for LibSqlBackend {
         let now = fmt_ts(&Utc::now());
         conn.execute(
             r#"
-                INSERT INTO conversations (id, channel, user_id, thread_id)
-                VALUES (?1, ?2, ?3, ?4)
+                INSERT INTO conversations (id, channel, user_id, thread_id, started_at, last_activity)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
                 ON CONFLICT (id) DO UPDATE SET last_activity = ?5
                 "#,
             params![id.to_string(), channel, user_id, opt_text(thread_id), now],
@@ -107,7 +108,7 @@ impl ConversationStore for LibSqlBackend {
                     ) AS title
                 FROM conversations c
                 WHERE c.user_id = ?1 AND c.channel = ?2
-                ORDER BY c.last_activity DESC
+                ORDER BY datetime(c.last_activity) DESC
                 LIMIT ?3
                 "#,
                 params![user_id, channel, limit],
@@ -126,6 +127,13 @@ impl ConversationStore for LibSqlBackend {
                 .get("thread_type")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let sql_title = get_opt_text(&row, 6);
+            let title = sql_title.or_else(|| {
+                metadata
+                    .get("routine_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
             results.push(ConversationSummary {
                 id: row
                     .get::<String>(0)
@@ -135,7 +143,7 @@ impl ConversationStore for LibSqlBackend {
                 started_at: get_ts(&row, 1),
                 last_activity: get_ts(&row, 2),
                 message_count: get_i64(&row, 5),
-                title: get_opt_text(&row, 6),
+                title,
                 thread_type,
                 channel: get_text(&row, 4),
             });
@@ -167,7 +175,7 @@ impl ConversationStore for LibSqlBackend {
                     ) AS title
                 FROM conversations c
                 WHERE c.user_id = ?1
-                ORDER BY c.last_activity DESC
+                ORDER BY datetime(c.last_activity) DESC
                 LIMIT ?2
                 "#,
                 params![user_id, limit],
@@ -186,6 +194,13 @@ impl ConversationStore for LibSqlBackend {
                 .get("thread_type")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let sql_title = get_opt_text(&row, 6);
+            let title = sql_title.or_else(|| {
+                metadata
+                    .get("routine_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
             results.push(ConversationSummary {
                 id: row
                     .get::<String>(0)
@@ -195,7 +210,7 @@ impl ConversationStore for LibSqlBackend {
                 started_at: get_ts(&row, 1),
                 last_activity: get_ts(&row, 2),
                 message_count: get_i64(&row, 5),
-                title: get_opt_text(&row, 6),
+                title,
                 thread_type,
                 channel: get_text(&row, 4),
             });
@@ -243,14 +258,15 @@ impl ConversationStore for LibSqlBackend {
             }
 
             let id = Uuid::new_v4();
+            let now = fmt_ts(&Utc::now());
             let metadata = serde_json::json!({
                 "thread_type": "routine",
                 "routine_id": routine_id.to_string(),
                 "routine_name": routine_name,
             });
             conn.execute(
-                "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
-                params![id.to_string(), "routine", user_id, metadata.to_string()],
+                "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![id.to_string(), "routine", user_id, metadata.to_string(), now],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -308,10 +324,11 @@ impl ConversationStore for LibSqlBackend {
             }
 
             let id = Uuid::new_v4();
+            let now = fmt_ts(&Utc::now());
             let metadata = serde_json::json!({ "thread_type": "heartbeat" });
             conn.execute(
-                "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
-                params![id.to_string(), "heartbeat", user_id, metadata.to_string()],
+                "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![id.to_string(), "heartbeat", user_id, metadata.to_string(), now],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -365,10 +382,11 @@ impl ConversationStore for LibSqlBackend {
 
         // Create new
         let id = Uuid::new_v4();
+        let now = fmt_ts(&Utc::now());
         let metadata = serde_json::json!({"thread_type": "assistant", "title": "Assistant"});
         conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), channel, user_id, metadata.to_string()],
+            "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id.to_string(), channel, user_id, metadata.to_string(), now],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -383,9 +401,10 @@ impl ConversationStore for LibSqlBackend {
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.connect().await?;
         let id = Uuid::new_v4();
+        let now = fmt_ts(&Utc::now());
         conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES (?1, ?2, ?3, ?4)",
-            params![id.to_string(), channel, user_id, metadata.to_string()],
+            "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id.to_string(), channel, user_id, metadata.to_string(), now],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;

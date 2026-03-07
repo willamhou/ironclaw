@@ -536,6 +536,9 @@ impl Agent {
                 doc_extraction.process(&mut message).await;
             }
 
+            // Store successfully extracted document text in workspace for indexing
+            self.store_extracted_documents(&message).await;
+
             match self.handle_message(&message).await {
                 Ok(Some(response)) if !response.is_empty() => {
                     // Hook: BeforeOutbound — allow hooks to modify or suppress outbound
@@ -632,6 +635,59 @@ impl Agent {
         self.channels.shutdown_all().await?;
 
         Ok(())
+    }
+
+    /// Store extracted document text in workspace memory for future search/recall.
+    async fn store_extracted_documents(&self, message: &IncomingMessage) {
+        let workspace = match self.workspace() {
+            Some(ws) => ws,
+            None => return,
+        };
+
+        for attachment in &message.attachments {
+            if attachment.kind != crate::channels::AttachmentKind::Document {
+                continue;
+            }
+            let text = match &attachment.extracted_text {
+                Some(t) if !t.starts_with('[') => t, // skip error messages like "[Failed to..."
+                _ => continue,
+            };
+
+            let filename = attachment
+                .filename
+                .as_deref()
+                .unwrap_or("unnamed_document");
+            let date = chrono::Utc::now().format("%Y-%m-%d");
+            let path = format!("documents/{date}/{filename}");
+
+            let header = format!(
+                "# {filename}\n\n\
+                 > Uploaded by **{}** via **{}** on {date}\n\
+                 > MIME: {} | Size: {} bytes\n\n---\n\n",
+                message.user_id,
+                message.channel,
+                attachment.mime_type,
+                attachment.size_bytes.unwrap_or(0),
+            );
+            let content = format!("{header}{text}");
+
+            match workspace.write(&path, &content).await {
+                Ok(_) => {
+                    tracing::info!(
+                        path = %path,
+                        text_len = text.len(),
+                        "Stored extracted document in workspace memory"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "Failed to store extracted document in workspace"
+                    );
+                }
+            }
+        }
     }
 
     async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<String>, Error> {

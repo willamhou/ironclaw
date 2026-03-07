@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-use crate::config::AnthropicDirectConfig;
+use crate::config::RegistryProviderConfig;
 use crate::error::LlmError;
 use crate::llm::costs;
 use crate::llm::provider::{
@@ -38,7 +38,7 @@ pub struct AnthropicOAuthProvider {
 }
 
 impl AnthropicOAuthProvider {
-    pub fn new(config: &AnthropicDirectConfig) -> Result<Self, LlmError> {
+    pub fn new(config: &RegistryProviderConfig) -> Result<Self, LlmError> {
         let token = config
             .oauth_token
             .clone()
@@ -55,12 +55,17 @@ impl AnthropicOAuthProvider {
             })?;
 
         let active_model = std::sync::RwLock::new(config.model.clone());
+        let base_url = if config.base_url.is_empty() {
+            None
+        } else {
+            Some(config.base_url.clone())
+        };
 
         Ok(Self {
             client,
             token,
             model: config.model.clone(),
-            base_url: config.base_url.clone(),
+            base_url,
             active_model,
         })
     }

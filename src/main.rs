@@ -23,7 +23,7 @@ use ironclaw::{
     },
     config::Config,
     hooks::bootstrap_hooks,
-    llm::{SessionConfig, create_session_manager},
+    llm::create_session_manager,
     orchestrator::{
         ContainerJobConfig, ContainerJobManager, OrchestratorApi, TokenStore,
         api::OrchestratorState,
@@ -44,8 +44,19 @@ fn init_cli_tracing() {
         .init();
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Synchronous entry point. Loads `.env` files before the Tokio runtime
+/// starts so that `std::env::set_var` is safe (no worker threads yet).
+fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
+    ironclaw::bootstrap::load_ironclaw_env();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Handle non-agent commands first (they don't need full setup)
@@ -80,14 +91,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Doctor) => {
             init_cli_tracing();
-            let _ = dotenvy::dotenv();
-            ironclaw::bootstrap::load_ironclaw_env();
             return ironclaw::cli::run_doctor_command().await;
         }
         Some(Command::Status) => {
             init_cli_tracing();
-            let _ = dotenvy::dotenv();
-            ironclaw::bootstrap::load_ironclaw_env();
             return run_status_command().await;
         }
         Some(Command::Completion(completion)) => {
@@ -114,22 +121,21 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Onboard {
             skip_auth,
             channels_only,
+            provider_only,
         }) => {
-            let _ = dotenvy::dotenv();
-            ironclaw::bootstrap::load_ironclaw_env();
-
             #[cfg(any(feature = "postgres", feature = "libsql"))]
             {
                 let config = SetupConfig {
                     skip_auth: *skip_auth,
                     channels_only: *channels_only,
+                    provider_only: *provider_only,
                 };
                 let mut wizard = SetupWizard::with_config(config);
                 wizard.run().await?;
             }
             #[cfg(not(any(feature = "postgres", feature = "libsql")))]
             {
-                let _ = (skip_auth, channels_only);
+                let _ = (skip_auth, channels_only, provider_only);
                 eprintln!("Onboarding wizard requires the 'postgres' or 'libsql' feature.");
             }
             return Ok(());
@@ -140,11 +146,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Agent startup ──────────────────────────────────────────────────
-
-    // Load .env files early so DATABASE_URL (and any other vars) are
-    // available to all subsequent env-based config resolution.
-    let _ = dotenvy::dotenv();
-    ironclaw::bootstrap::load_ironclaw_env();
 
     // Enhanced first-run detection
     #[cfg(any(feature = "postgres", feature = "libsql"))]
@@ -176,12 +177,8 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    // Initialize session manager and authenticate before channel setup
-    let session_config = SessionConfig {
-        auth_base_url: config.llm.nearai.auth_base_url.clone(),
-        session_path: config.llm.nearai.session_path.clone(),
-    };
-    let session = create_session_manager(session_config).await;
+    // Initialize session manager before channel setup
+    let session = create_session_manager(config.llm.session.clone()).await;
 
     // Create log broadcaster before tracing init so the WebLogLayer can capture all events.
     let log_broadcaster = Arc::new(LogBroadcaster::new());
@@ -209,13 +206,6 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     let config = components.config;
-
-    // Session-based auth is only needed for NEAR AI backend without an API key.
-    if config.llm.backend == ironclaw::config::LlmBackend::NearAi
-        && config.llm.nearai.api_key.is_none()
-    {
-        session.ensure_authenticated().await?;
-    }
 
     // ── Tunnel setup ───────────────────────────────────────────────────
 
@@ -351,6 +341,7 @@ async fn main() -> anyhow::Result<()> {
             &config,
             &components.secrets_store,
             components.extension_manager.as_ref(),
+            components.db.as_ref(),
         )
         .await;
 
@@ -459,9 +450,16 @@ async fn main() -> anyhow::Result<()> {
     let session_manager =
         Arc::new(ironclaw::agent::SessionManager::new().with_hooks(components.hooks.clone()));
 
+    // Lazy scheduler slot — filled after Agent::new creates the Scheduler.
+    // Allows CreateJobTool to dispatch local jobs via the Scheduler even though
+    // the Scheduler is created after tools are registered (chicken-and-egg).
+    let scheduler_slot: ironclaw::tools::builtin::SchedulerSlot =
+        Arc::new(tokio::sync::RwLock::new(None));
+
     // Register job tools (sandbox deps auto-injected when container_job_manager is available)
     components.tools.register_job_tools(
         Arc::clone(&components.context_manager),
+        Some(scheduler_slot.clone()),
         container_job_manager.clone(),
         components.db.clone(),
         job_event_tx.clone(),
@@ -480,8 +478,6 @@ async fn main() -> anyhow::Result<()> {
     let mut sse_sender: Option<
         tokio::sync::broadcast::Sender<ironclaw::channels::web::types::SseEvent>,
     > = None;
-    let mut gateway_state: Option<std::sync::Arc<ironclaw::channels::web::server::GatewayState>> =
-        None;
     if let Some(ref gw_config) = config.channels.gateway {
         let mut gw =
             GatewayChannel::new(gw_config.clone()).with_llm_provider(Arc::clone(&components.llm));
@@ -504,6 +500,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref jm) = container_job_manager {
             gw = gw.with_job_manager(Arc::clone(jm));
         }
+        gw = gw.with_scheduler(scheduler_slot.clone());
         if let Some(ref sr) = components.skill_registry {
             gw = gw.with_skill_registry(Arc::clone(sr));
         }
@@ -538,7 +535,6 @@ async fn main() -> anyhow::Result<()> {
         // IMPORTANT: This must come after all `with_*` calls since `rebuild_state`
         // creates a new SseManager, which would orphan this sender.
         sse_sender = Some(gw.state().sse.sender());
-        gateway_state = Some(Arc::clone(gw.state()));
 
         channel_names.push("gateway".to_string());
         channels.add(Box::new(gw)).await;
@@ -595,29 +591,72 @@ async fn main() -> anyhow::Result<()> {
 
     let channels = Arc::new(channels);
 
+    // Register message tool for sending messages to connected channels
+    components
+        .tools
+        .register_message_tools(Arc::clone(&channels))
+        .await;
+
     // Wire up channel runtime for hot-activation of WASM channels.
     if let Some(ref ext_mgr) = components.extension_manager
         && let Some((rt, ps, router)) = wasm_channel_runtime_state.take()
     {
+        let active_at_startup: std::collections::HashSet<String> =
+            loaded_wasm_channel_names.iter().cloned().collect();
+        ext_mgr.set_active_channels(loaded_wasm_channel_names).await;
         ext_mgr
             .set_channel_runtime(
                 Arc::clone(&channels),
                 rt,
                 ps,
                 router,
-                config.channels.telegram_owner_id,
+                config.channels.wasm_channel_owner_ids.clone(),
             )
             .await;
         tracing::info!("Channel runtime wired into extension manager for hot-activation");
+
+        // Auto-activate channels that were active in a previous session.
+        let persisted = ext_mgr.load_persisted_active_channels().await;
+        for name in &persisted {
+            if !active_at_startup.contains(name) {
+                match ext_mgr.activate(name).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            channel = %name,
+                            message = %result.message,
+                            "Auto-activated persisted channel"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            channel = %name,
+                            error = %e,
+                            "Failed to auto-activate persisted channel"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // Wire SSE sender into extension manager for broadcasting status events.
     if let Some(ref ext_mgr) = components.extension_manager
-        && let Some(sender) = sse_sender
+        && let Some(ref sender) = sse_sender
     {
-        ext_mgr.set_sse_sender(sender).await;
+        ext_mgr.set_sse_sender(sender.clone()).await;
     }
 
+    // Snapshot memory for trace recording before the agent starts
+    if let Some(ref recorder) = components.recording_handle
+        && let Some(ref ws) = components.workspace
+    {
+        recorder.snapshot_memory(ws).await;
+    }
+
+    let http_interceptor = components
+        .recording_handle
+        .as_ref()
+        .map(|r| r.http_interceptor());
     let deps = AgentDeps {
         store: components.db,
         llm: components.llm,
@@ -631,6 +670,8 @@ async fn main() -> anyhow::Result<()> {
         skills_config: config.skills.clone(),
         hooks: components.hooks,
         cost_guard: components.cost_guard,
+        sse_tx: sse_sender,
+        http_interceptor,
     };
 
     let agent = Agent::new(
@@ -644,9 +685,19 @@ async fn main() -> anyhow::Result<()> {
         Some(session_manager),
     );
 
+    // Fill the scheduler slot now that Agent (and its Scheduler) exist.
+    *scheduler_slot.write().await = Some(agent.scheduler());
+
     agent.run().await?;
 
     // ── Shutdown ────────────────────────────────────────────────────────
+
+    // Flush LLM trace recording if enabled
+    if let Some(ref recorder) = components.recording_handle
+        && let Err(e) = recorder.flush().await
+    {
+        tracing::warn!("Failed to write LLM trace: {}", e);
+    }
 
     if let Some(ref mut server) = webhook_server {
         server.shutdown().await;
@@ -660,16 +711,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("Agent shutdown complete");
-
-    // Check if a restart was requested via the gateway API.
-    if let Some(ref gw_state) = gateway_state
-        && gw_state
-            .restart_requested
-            .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        eprintln!("Restarting IronClaw (exit code 75)...");
-        std::process::exit(75);
-    }
 
     Ok(())
 }
@@ -691,30 +732,11 @@ async fn run_memory_command(mem_cmd: &ironclaw::cli::MemoryCommand) -> anyhow::R
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let session = create_session_manager(SessionConfig {
-        auth_base_url: config.llm.nearai.auth_base_url.clone(),
-        session_path: config.llm.nearai.session_path.clone(),
-    })
-    .await;
+    let session = create_session_manager(config.llm.session.clone()).await;
 
     let embeddings = config
         .embeddings
         .create_provider(&config.llm.nearai.base_url, session);
-
-    // Warn if libSQL backend is used with non-1536 embedding dimension.
-    if config.database.backend == ironclaw::config::DatabaseBackend::LibSql
-        && config.embeddings.enabled
-        && config.embeddings.dimension != 1536
-    {
-        tracing::warn!(
-            configured_dimension = config.embeddings.dimension,
-            "Embedding dimension {} is not 1536. The libSQL schema uses \
-             F32_BLOB(1536) which requires exactly 1536 dimensions. \
-             Embedding storage will fail. Use PostgreSQL or set \
-             EMBEDDING_DIMENSION=1536.",
-            config.embeddings.dimension
-        );
-    }
 
     let db: Arc<dyn ironclaw::db::Database> = ironclaw::db::connect_from_config(&config.database)
         .await
@@ -859,6 +881,7 @@ async fn setup_wasm_channels(
     config: &ironclaw::config::Config,
     secrets_store: &Option<Arc<dyn SecretsStore + Send + Sync>>,
     extension_manager: Option<&Arc<ironclaw::extensions::ExtensionManager>>,
+    database: Option<&Arc<dyn ironclaw::db::Database>>,
 ) -> Option<WasmChannelSetup> {
     let runtime = match WasmChannelRuntime::new(WasmChannelRuntimeConfig::default()) {
         Ok(r) => Arc::new(r),
@@ -869,7 +892,16 @@ async fn setup_wasm_channels(
     };
 
     let pairing_store = Arc::new(PairingStore::new());
-    let loader = WasmChannelLoader::new(Arc::clone(&runtime), Arc::clone(&pairing_store));
+    let settings_store: Option<Arc<dyn ironclaw::db::SettingsStore>> =
+        database.map(|db| Arc::clone(db) as Arc<dyn ironclaw::db::SettingsStore>);
+    let mut loader = WasmChannelLoader::new(
+        Arc::clone(&runtime),
+        Arc::clone(&pairing_store),
+        settings_store,
+    );
+    if let Some(secrets) = secrets_store {
+        loader = loader.with_secrets_store(Arc::clone(secrets));
+    }
 
     let results = match loader
         .load_from_dir(&config.channels.wasm_channels_dir)
@@ -892,6 +924,8 @@ async fn setup_wasm_channels(
         tracing::info!("Loaded WASM channel: {}", channel_name);
 
         let secret_name = loaded.webhook_secret_name();
+        let sig_key_secret_name = loaded.signature_key_secret_name();
+        let hmac_secret_name = loaded.hmac_secret_name();
 
         let webhook_secret = if let Some(secrets) = secrets_store {
             secrets
@@ -932,9 +966,11 @@ async fn setup_wasm_channels(
                 );
             }
 
-            // Inject owner_id for Telegram so the bot only responds to the bound user.
-            if channel_name == "telegram"
-                && let Some(owner_id) = config.channels.telegram_owner_id
+            // Inject owner_id if configured for this channel.
+            if let Some(&owner_id) = config
+                .channels
+                .wasm_channel_owner_ids
+                .get(channel_name.as_str())
             {
                 config_updates.insert("owner_id".to_string(), serde_json::json!(owner_id));
             }
@@ -965,6 +1001,36 @@ async fn setup_wasm_channels(
                 secret_header,
             )
             .await;
+
+        // Register Ed25519 signature key if declared in capabilities
+        if let Some(ref sig_key_name) = sig_key_secret_name
+            && let Some(secrets) = secrets_store
+            && let Ok(key_secret) = secrets.get_decrypted("default", sig_key_name).await
+        {
+            match wasm_router
+                .register_signature_key(&channel_name, key_secret.expose())
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(channel = %channel_name, "Registered Ed25519 signature key")
+                }
+                Err(e) => {
+                    tracing::error!(channel = %channel_name, error = %e, "Invalid signature key in secrets store")
+                }
+            }
+        }
+
+        // Register HMAC signing secret if declared in capabilities
+        if let Some(ref hmac_secret_name) = hmac_secret_name
+            && let Some(secrets) = secrets_store
+            && let Ok(secret) = secrets.get_decrypted("default", hmac_secret_name).await
+        {
+            wasm_router
+                .register_hmac_secret(&channel_name, secret.expose())
+                .await;
+            tracing::info!(channel = %channel_name, "Registered HMAC signing secret");
+        }
+
         if let Some(secrets) = secrets_store {
             match inject_channel_credentials(&channel_arc, secrets.as_ref(), &channel_name).await {
                 Ok(count) => {

@@ -47,14 +47,22 @@ impl SafetyLayer {
 
     /// Sanitize tool output before it reaches the LLM.
     pub fn sanitize_tool_output(&self, tool_name: &str, output: &str) -> SanitizedOutput {
-        // Check length limits first
+        // Check length limits — keep the beginning so the LLM has partial data
         if output.len() > self.config.max_output_length {
+            // Find a safe truncation point on a char boundary
+            let mut cut = self.config.max_output_length;
+            while cut > 0 && !output.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let truncated = &output[..cut];
+            let notice = format!(
+                "\n\n[... truncated: showing {}/{} bytes. Use the json tool with \
+                 source_tool_call_id to query the full output.]",
+                cut,
+                output.len()
+            );
             return SanitizedOutput {
-                content: format!(
-                    "[Output truncated: {} bytes exceeded maximum of {} bytes]",
-                    output.len(),
-                    self.config.max_output_length
-                ),
+                content: format!("{}{}", truncated, notice),
                 warnings: vec![InjectionWarning {
                     pattern: "output_too_large".to_string(),
                     severity: Severity::Low,
@@ -124,6 +132,22 @@ impl SafetyLayer {
     /// Validate input before processing.
     pub fn validate_input(&self, input: &str) -> ValidationResult {
         self.validator.validate(input)
+    }
+
+    /// Scan user input for leaked secrets (API keys, tokens, etc.).
+    ///
+    /// Returns `Some(warning)` if the input contains what looks like a secret,
+    /// so the caller can reject the message early instead of sending it to the
+    /// LLM (which might echo it back and trigger an outbound block loop).
+    pub fn scan_inbound_for_secrets(&self, input: &str) -> Option<String> {
+        let warning = "Your message appears to contain a secret (API key, token, or credential). \
+             For security, it was not sent to the AI. Please remove the secret and try again. \
+             To store credentials, use the setup form or `ironclaw config set <name> <value>`.";
+        match self.leak_detector.scan_and_clean(input) {
+            Ok(cleaned) if cleaned != input => Some(warning.to_string()),
+            Err(_) => Some(warning.to_string()),
+            _ => None, // Clean input
+        }
     }
 
     /// Check if content violates any policy rules.

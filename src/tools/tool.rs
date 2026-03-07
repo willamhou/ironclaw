@@ -28,6 +28,62 @@ impl ApprovalRequirement {
     }
 }
 
+/// Approval context for autonomous tool execution (routines, background jobs).
+///
+/// Interactive sessions don't use this type — they rely on session-level
+/// auto-approve lists managed by the UI. This enum models only the autonomous
+/// case where no interactive user is present.
+#[derive(Debug, Clone)]
+pub enum ApprovalContext {
+    /// Autonomous job with no interactive user. `UnlessAutoApproved` tools are
+    /// pre-approved. `Always` tools are blocked unless listed in `allowed_tools`.
+    Autonomous {
+        /// Tool names that are pre-authorized even for `Always` approval.
+        allowed_tools: std::collections::HashSet<String>,
+    },
+}
+
+impl ApprovalContext {
+    /// Create an autonomous context with no extra tool permissions.
+    pub fn autonomous() -> Self {
+        Self::Autonomous {
+            allowed_tools: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Create an autonomous context with specific tools pre-authorized.
+    pub fn autonomous_with_tools(tools: impl IntoIterator<Item = String>) -> Self {
+        Self::Autonomous {
+            allowed_tools: tools.into_iter().collect(),
+        }
+    }
+
+    /// Check whether a tool invocation is blocked in this context.
+    pub fn is_blocked(&self, tool_name: &str, requirement: ApprovalRequirement) -> bool {
+        match self {
+            Self::Autonomous { allowed_tools } => match requirement {
+                ApprovalRequirement::Never => false,
+                ApprovalRequirement::UnlessAutoApproved => false,
+                ApprovalRequirement::Always => !allowed_tools.contains(tool_name),
+            },
+        }
+    }
+
+    /// Check whether a tool is blocked given an optional context.
+    ///
+    /// When `None`, falls back to legacy behavior: all non-`Never` tools are blocked.
+    pub fn is_blocked_or_default(
+        context: &Option<Self>,
+        tool_name: &str,
+        requirement: ApprovalRequirement,
+    ) -> bool {
+        match context {
+            Some(ctx) => ctx.is_blocked(tool_name, requirement),
+            None => requirement.is_required(),
+        }
+    }
+}
+
 /// Per-tool rate limit configuration for built-in tool invocations.
 ///
 /// Controls how many times a tool can be invoked per user, per time window.
@@ -239,6 +295,23 @@ pub trait Tool: Send + Sync {
         ToolDomain::Orchestrator
     }
 
+    /// Parameter names whose values must be redacted before logging, hooks, and approvals.
+    ///
+    /// The agent framework replaces these parameter values with `"[REDACTED]"` before:
+    /// - Writing to debug logs
+    /// - Storing in `ActionRecord` (in-memory job history)
+    /// - Recording in `TurnToolCall` (session state)
+    /// - Sending to `BeforeToolCall` hooks
+    /// - Displaying in the approval UI
+    ///
+    /// **The `execute()` method still receives the original, unredacted parameters.**
+    /// Redaction only applies to the observability and audit paths, not execution.
+    ///
+    /// Use this for tools that accept plaintext secrets as parameters (e.g. `secret_save`).
+    fn sensitive_params(&self) -> &[&str] {
+        &[]
+    }
+
     /// Per-invocation rate limit for this tool.
     ///
     /// Return `Some(config)` to throttle how often this tool can be called per user.
@@ -285,6 +358,123 @@ pub fn require_param<'a>(
     params
         .get(name)
         .ok_or_else(|| ToolError::InvalidParameters(format!("missing '{}' parameter", name)))
+}
+
+/// Replace sensitive parameter values with `"[REDACTED]"`.
+///
+/// Returns a new JSON value with the specified keys replaced. Non-object params
+/// and unknown keys are passed through unchanged. The original value is cloned
+/// only if there are sensitive params to redact; otherwise it is cloned once
+/// (cheap — callers own the result).
+///
+/// Used by the agent framework before logging, hook dispatch, approval display,
+/// and `ActionRecord` storage so plaintext secrets never reach those paths.
+pub fn redact_params(params: &serde_json::Value, sensitive: &[&str]) -> serde_json::Value {
+    if sensitive.is_empty() {
+        return params.clone();
+    }
+    let mut redacted = params.clone();
+    if let Some(obj) = redacted.as_object_mut() {
+        for key in sensitive {
+            if obj.contains_key(*key) {
+                obj.insert(
+                    (*key).to_string(),
+                    serde_json::Value::String("[REDACTED]".into()),
+                );
+            }
+        }
+    }
+    redacted
+}
+
+/// Lenient runtime validation of a tool's `parameters_schema()`.
+///
+/// Use this function at tool-registration time to catch structural mistakes
+/// (missing `"type": "object"`, orphan `"required"` keys, arrays without
+/// `"items"`) without rejecting intentional freeform properties.
+///
+/// For the stricter variant that also enforces `additionalProperties: false`,
+/// enum-type consistency, and per-property `"type"` fields, see
+/// [`validate_strict_schema`](crate::tools::schema_validator::validate_strict_schema)
+/// in `schema_validator.rs` (used in CI tests).
+///
+/// Returns a list of validation errors. An empty list means the schema is valid.
+///
+/// # Rules enforced
+///
+/// 1. Top-level must have `"type": "object"`
+/// 2. Top-level must have `"properties"` as an object
+/// 3. Every key in `"required"` must exist in `"properties"`
+/// 4. Nested objects follow the same rules recursively
+/// 5. Array properties should have `"items"` defined
+///
+/// Properties without a `"type"` field are allowed (freeform/any-type).
+/// This is an intentional pattern used by tools like `json` and `http` for
+/// OpenAI compatibility, since union types with arrays require `items`.
+pub fn validate_tool_schema(schema: &serde_json::Value, path: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // Rule 1: must have "type": "object" at this level
+    match schema.get("type").and_then(|t| t.as_str()) {
+        Some("object") => {}
+        Some(other) => {
+            errors.push(format!("{path}: expected type \"object\", got \"{other}\""));
+            return errors; // Can't check further
+        }
+        None => {
+            errors.push(format!("{path}: missing \"type\": \"object\""));
+            return errors;
+        }
+    }
+
+    // Rule 2: must have "properties" as an object
+    let properties = match schema.get("properties").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => {
+            errors.push(format!("{path}: missing or non-object \"properties\""));
+            return errors;
+        }
+    };
+
+    // Rule 3: every key in "required" must exist in "properties"
+    if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+        for req in required {
+            if let Some(key) = req.as_str()
+                && !properties.contains_key(key)
+            {
+                errors.push(format!(
+                    "{path}: required key \"{key}\" not found in properties"
+                ));
+            }
+        }
+    }
+
+    // Rule 4 & 5: recurse into nested objects and check arrays
+    for (key, prop) in properties {
+        let prop_path = format!("{path}.{key}");
+        if let Some(prop_type) = prop.get("type").and_then(|t| t.as_str()) {
+            match prop_type {
+                "object" => {
+                    errors.extend(validate_tool_schema(prop, &prop_path));
+                }
+                "array" => {
+                    if let Some(items) = prop.get("items") {
+                        // If items is an object type, recurse
+                        if items.get("type").and_then(|t| t.as_str()) == Some("object") {
+                            errors
+                                .extend(validate_tool_schema(items, &format!("{prop_path}.items")));
+                        }
+                    } else {
+                        errors.push(format!("{prop_path}: array property missing \"items\""));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // No "type" field is intentionally allowed (freeform properties)
+    }
+
+    errors
 }
 
 #[cfg(test)]
@@ -408,5 +598,260 @@ mod tests {
         assert!(!ApprovalRequirement::Never.is_required());
         assert!(ApprovalRequirement::UnlessAutoApproved.is_required());
         assert!(ApprovalRequirement::Always.is_required());
+    }
+
+    #[test]
+    fn test_redact_params_replaces_sensitive_key() {
+        let params = serde_json::json!({"name": "openai_key", "value": "sk-secret"});
+        let redacted = redact_params(&params, &["value"]);
+        assert_eq!(redacted["name"], "openai_key");
+        assert_eq!(redacted["value"], "[REDACTED]");
+        // Original unchanged
+        assert_eq!(params["value"], "sk-secret");
+    }
+
+    #[test]
+    fn test_redact_params_empty_sensitive_is_noop() {
+        let params = serde_json::json!({"name": "key", "value": "secret"});
+        let redacted = redact_params(&params, &[]);
+        assert_eq!(redacted, params);
+    }
+
+    #[test]
+    fn test_redact_params_missing_key_is_noop() {
+        let params = serde_json::json!({"name": "key"});
+        let redacted = redact_params(&params, &["value"]);
+        assert_eq!(redacted, params);
+    }
+
+    #[test]
+    fn test_redact_params_non_object_is_passthrough() {
+        let params = serde_json::json!("just a string");
+        let redacted = redact_params(&params, &["value"]);
+        assert_eq!(redacted, params);
+    }
+
+    #[test]
+    fn test_validate_schema_valid() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "A name" }
+            },
+            "required": ["name"]
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_validate_schema_missing_type() {
+        let schema = serde_json::json!({
+            "properties": {
+                "name": { "type": "string" }
+            }
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("missing \"type\": \"object\""));
+    }
+
+    #[test]
+    fn test_validate_schema_wrong_type() {
+        let schema = serde_json::json!({
+            "type": "string"
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("expected type \"object\""));
+    }
+
+    #[test]
+    fn test_validate_schema_required_not_in_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" }
+            },
+            "required": ["name", "age"]
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("\"age\" not found in properties"));
+    }
+
+    #[test]
+    fn test_validate_schema_nested_object() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string" }
+                    },
+                    "required": ["key", "missing"]
+                }
+            }
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("test.config"));
+        assert!(errors[0].contains("\"missing\" not found"));
+    }
+
+    #[test]
+    fn test_validate_schema_array_missing_items() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tags": { "type": "array", "description": "Tags" }
+            }
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("array property missing \"items\""));
+    }
+
+    #[test]
+    fn test_validate_schema_array_with_items_ok() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            }
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_validate_schema_freeform_property_allowed() {
+        // Properties without "type" are intentionally allowed (json/http tools)
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "data": { "description": "Any JSON value" }
+            },
+            "required": ["data"]
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert!(
+            errors.is_empty(),
+            "freeform property should be allowed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_schema_nested_array_items_object() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "headers": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "value": { "type": "string" }
+                        },
+                        "required": ["name", "value"]
+                    }
+                }
+            }
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_validate_schema_nested_array_items_object_bad() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "headers": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" }
+                        },
+                        "required": ["name", "missing_field"]
+                    }
+                }
+            }
+        });
+        let errors = validate_tool_schema(&schema, "test");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("headers.items"));
+        assert!(errors[0].contains("\"missing_field\""));
+    }
+
+    #[test]
+    fn test_approval_context_autonomous_allows_unless_auto_approved() {
+        let ctx = ApprovalContext::autonomous();
+        assert!(!ctx.is_blocked("shell", ApprovalRequirement::Never));
+        assert!(!ctx.is_blocked("shell", ApprovalRequirement::UnlessAutoApproved));
+        assert!(ctx.is_blocked("shell", ApprovalRequirement::Always));
+    }
+
+    #[test]
+    fn test_approval_context_autonomous_with_tools_allows_always() {
+        let ctx =
+            ApprovalContext::autonomous_with_tools(["shell".to_string(), "message".to_string()]);
+        assert!(!ctx.is_blocked("shell", ApprovalRequirement::Always));
+        assert!(!ctx.is_blocked("message", ApprovalRequirement::Always));
+        assert!(ctx.is_blocked("http", ApprovalRequirement::Always));
+    }
+
+    #[test]
+    fn test_approval_context_never_is_not_blocked() {
+        let ctx = ApprovalContext::autonomous();
+        assert!(!ctx.is_blocked("any_tool", ApprovalRequirement::Never));
+    }
+
+    #[test]
+    fn test_is_blocked_or_default_with_none_uses_legacy() {
+        // None context: all non-Never tools are blocked
+        assert!(!ApprovalContext::is_blocked_or_default(
+            &None,
+            "any",
+            ApprovalRequirement::Never
+        ));
+        assert!(ApprovalContext::is_blocked_or_default(
+            &None,
+            "any",
+            ApprovalRequirement::UnlessAutoApproved
+        ));
+        assert!(ApprovalContext::is_blocked_or_default(
+            &None,
+            "any",
+            ApprovalRequirement::Always
+        ));
+    }
+
+    #[test]
+    fn test_is_blocked_or_default_with_some_delegates() {
+        let ctx = Some(ApprovalContext::autonomous_with_tools(
+            ["shell".to_string()],
+        ));
+        assert!(!ApprovalContext::is_blocked_or_default(
+            &ctx,
+            "shell",
+            ApprovalRequirement::Always
+        ));
+        assert!(ApprovalContext::is_blocked_or_default(
+            &ctx,
+            "other",
+            ApprovalRequirement::Always
+        ));
+        assert!(!ApprovalContext::is_blocked_or_default(
+            &ctx,
+            "any",
+            ApprovalRequirement::UnlessAutoApproved
+        ));
     }
 }

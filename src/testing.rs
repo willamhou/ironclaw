@@ -293,6 +293,8 @@ impl TestHarnessBuilder {
             skills_config: SkillsConfig::default(),
             hooks,
             cost_guard,
+            sse_tx: None,
+            http_interceptor: None,
         };
 
         TestHarness {
@@ -342,6 +344,304 @@ mod tests {
         assert!(!id.is_nil());
     }
 
+    // === QA Plan P1 - 2.2: Turn persistence round-trip tests ===
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_conversation_message_round_trip() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let conv_id = db
+            .create_conversation("tui", "alice", None)
+            .await
+            .expect("create conversation");
+
+        // Add several messages in order.
+        let m1 = db
+            .add_conversation_message(conv_id, "user", "Hello!")
+            .await
+            .expect("add msg 1");
+        let m2 = db
+            .add_conversation_message(conv_id, "assistant", "Hi there!")
+            .await
+            .expect("add msg 2");
+        let m3 = db
+            .add_conversation_message(conv_id, "user", "How are you?")
+            .await
+            .expect("add msg 3");
+
+        // IDs must be unique.
+        assert_ne!(m1, m2);
+        assert_ne!(m2, m3);
+
+        // List messages and verify content + ordering.
+        let msgs = db
+            .list_conversation_messages(conv_id)
+            .await
+            .expect("list messages");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "Hello!");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].content, "Hi there!");
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(msgs[2].content, "How are you?");
+
+        // Timestamps should be monotonically non-decreasing.
+        assert!(msgs[0].created_at <= msgs[1].created_at);
+        assert!(msgs[1].created_at <= msgs[2].created_at);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_conversation_metadata_persistence() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let conv_id = db
+            .create_conversation("web", "bob", None)
+            .await
+            .expect("create conversation");
+
+        // Initially no metadata.
+        let meta = db
+            .get_conversation_metadata(conv_id)
+            .await
+            .expect("get metadata");
+        // May be None or empty object depending on backend.
+        if let Some(m) = &meta {
+            assert!(m.is_null() || m.as_object().is_none_or(|o| o.is_empty()));
+        }
+
+        // Set a metadata field.
+        db.update_conversation_metadata_field(
+            conv_id,
+            "thread_type",
+            &serde_json::json!("assistant"),
+        )
+        .await
+        .expect("set thread_type");
+
+        // Read it back.
+        let meta = db
+            .get_conversation_metadata(conv_id)
+            .await
+            .expect("get metadata after update")
+            .expect("metadata should exist");
+        assert_eq!(meta["thread_type"], "assistant");
+
+        // Update with a second field — first field should still be there.
+        db.update_conversation_metadata_field(conv_id, "model", &serde_json::json!("gpt-4"))
+            .await
+            .expect("set model");
+
+        let meta = db
+            .get_conversation_metadata(conv_id)
+            .await
+            .expect("get metadata after second update")
+            .expect("metadata should exist");
+        assert_eq!(meta["thread_type"], "assistant");
+        assert_eq!(meta["model"], "gpt-4");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_conversation_belongs_to_user() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let conv_id = db
+            .create_conversation("tui", "alice", None)
+            .await
+            .expect("create conversation");
+
+        // Owner check should pass.
+        assert!(
+            db.conversation_belongs_to_user(conv_id, "alice")
+                .await
+                .expect("belongs check")
+        );
+
+        // Different user should NOT own it.
+        assert!(
+            !db.conversation_belongs_to_user(conv_id, "mallory")
+                .await
+                .expect("belongs check other user")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_ensure_conversation_idempotent() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let conv_id = uuid::Uuid::new_v4();
+
+        // ensure_conversation should create the row.
+        db.ensure_conversation(conv_id, "web", "carol", None)
+            .await
+            .expect("ensure first");
+
+        // Calling again with the same ID should not error.
+        db.ensure_conversation(conv_id, "web", "carol", None)
+            .await
+            .expect("ensure second (idempotent)");
+
+        // Should be able to add messages to it.
+        let msg_id = db
+            .add_conversation_message(conv_id, "user", "test message")
+            .await
+            .expect("add message to ensured conversation");
+        assert!(!msg_id.is_nil());
+
+        // Verify the message is there.
+        let msgs = db
+            .list_conversation_messages(conv_id)
+            .await
+            .expect("list messages");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "test message");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_paginated_messages() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let conv_id = db
+            .create_conversation("tui", "dave", None)
+            .await
+            .expect("create conversation");
+
+        // Add messages.
+        for i in 0..5 {
+            db.add_conversation_message(conv_id, "user", &format!("msg {i}"))
+                .await
+                .expect("add message");
+        }
+
+        // First page with limit 3, no cursor. Returns newest-first.
+        let (page1, has_more) = db
+            .list_conversation_messages_paginated(conv_id, None, 3)
+            .await
+            .expect("page 1");
+        assert_eq!(page1.len(), 3, "first page should have 3 messages");
+        assert!(has_more, "should indicate more messages exist");
+
+        // Verify all messages can be retrieved with a large limit.
+        let (all, _) = db
+            .list_conversation_messages_paginated(conv_id, None, 100)
+            .await
+            .expect("all messages");
+        assert_eq!(all.len(), 5);
+
+        // Messages are returned oldest-first (ascending created_at).
+        for w in all.windows(2) {
+            assert!(
+                w[0].created_at <= w[1].created_at,
+                "messages should be in ascending created_at order"
+            );
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_conversations_with_preview() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        // Create two conversations for the same user.
+        let c1 = db
+            .create_conversation("tui", "eve", None)
+            .await
+            .expect("create c1");
+        db.add_conversation_message(c1, "user", "First conversation opener")
+            .await
+            .expect("add msg to c1");
+
+        let c2 = db
+            .create_conversation("tui", "eve", None)
+            .await
+            .expect("create c2");
+        db.add_conversation_message(c2, "user", "Second conversation opener")
+            .await
+            .expect("add msg to c2");
+
+        // List with preview.
+        let summaries = db
+            .list_conversations_with_preview("eve", "tui", 10)
+            .await
+            .expect("list with preview");
+
+        assert_eq!(summaries.len(), 2);
+        // Both should have message_count >= 1.
+        for s in &summaries {
+            assert!(s.message_count >= 1);
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_job_action_persistence() {
+        use crate::context::{ActionRecord, JobContext, JobState};
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let ctx = JobContext::with_user("user1", "Do something", "test task");
+
+        let job_id = ctx.job_id;
+
+        // Save job.
+        db.save_job(&ctx).await.expect("save job");
+
+        // Get job back.
+        let fetched = db.get_job(job_id).await.expect("get job");
+        assert!(fetched.is_some());
+        let fetched = fetched.unwrap();
+        assert_eq!(fetched.job_id, job_id);
+
+        // Save an action.
+        let action = ActionRecord {
+            id: uuid::Uuid::new_v4(),
+            sequence: 1,
+            tool_name: "echo".to_string(),
+            input: serde_json::json!({"message": "hello"}),
+            output_raw: Some("hello".to_string()),
+            output_sanitized: None,
+            sanitization_warnings: vec![],
+            cost: None,
+            duration: std::time::Duration::from_millis(42),
+            success: true,
+            error: None,
+            executed_at: chrono::Utc::now(),
+        };
+        db.save_action(job_id, &action).await.expect("save action");
+
+        // Retrieve actions.
+        let actions = db.get_job_actions(job_id).await.expect("get actions");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].tool_name, "echo");
+        assert_eq!(actions[0].output_raw, Some("hello".to_string()));
+        assert!(actions[0].success);
+        assert_eq!(actions[0].duration, std::time::Duration::from_millis(42));
+
+        // Update job status.
+        db.update_job_status(job_id, JobState::Completed, None)
+            .await
+            .expect("update status");
+
+        let updated = db
+            .get_job(job_id)
+            .await
+            .expect("get updated job")
+            .expect("job should exist");
+        assert!(matches!(updated.state, JobState::Completed));
+    }
+
     #[tokio::test]
     async fn test_stub_llm_complete() {
         let llm = StubLlm::new("hello world");
@@ -351,5 +651,584 @@ mod tests {
             .expect("complete");
         assert_eq!(response.content, "hello world");
         assert_eq!(response.finish_reason, FinishReason::Stop);
+    }
+
+    // === Database CRUD coverage for untested trait methods ===
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_settings_crud() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        // Initially no setting
+        let val = db.get_setting("user1", "theme").await.expect("get");
+        assert!(val.is_none());
+
+        // Set a value
+        db.set_setting("user1", "theme", &serde_json::json!("dark"))
+            .await
+            .expect("set");
+
+        // Read it back
+        let val = db
+            .get_setting("user1", "theme")
+            .await
+            .expect("get")
+            .expect("should exist");
+        assert_eq!(val, serde_json::json!("dark"));
+
+        // Update it
+        db.set_setting("user1", "theme", &serde_json::json!("light"))
+            .await
+            .expect("set update");
+        let val = db
+            .get_setting("user1", "theme")
+            .await
+            .expect("get")
+            .expect("should exist");
+        assert_eq!(val, serde_json::json!("light"));
+
+        // List settings
+        let all = db.list_settings("user1").await.expect("list");
+        assert_eq!(all.len(), 1);
+
+        // Delete
+        let deleted = db.delete_setting("user1", "theme").await.expect("delete");
+        assert!(deleted);
+
+        let val = db.get_setting("user1", "theme").await.expect("get");
+        assert!(val.is_none());
+
+        // Delete non-existent
+        let deleted = db.delete_setting("user1", "theme").await.expect("delete");
+        assert!(!deleted);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_settings_bulk_operations() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        // Initially no settings
+        let has = db.has_settings("bulk_user").await.expect("has_settings");
+        assert!(!has);
+
+        // Set all settings at once
+        let mut settings = std::collections::HashMap::new();
+        settings.insert("key1".to_string(), serde_json::json!("value1"));
+        settings.insert("key2".to_string(), serde_json::json!(42));
+        db.set_all_settings("bulk_user", &settings)
+            .await
+            .expect("set_all");
+
+        // Has settings should now be true
+        let has = db.has_settings("bulk_user").await.expect("has_settings");
+        assert!(has);
+
+        // Get all settings
+        let all = db.get_all_settings("bulk_user").await.expect("get_all");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["key1"], serde_json::json!("value1"));
+        assert_eq!(all["key2"], serde_json::json!(42));
+
+        // Get full setting row
+        let full = db
+            .get_setting_full("bulk_user", "key1")
+            .await
+            .expect("get_full")
+            .expect("should exist");
+        assert_eq!(full.key, "key1");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_tool_failure_tracking() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        // Record some failures
+        db.record_tool_failure("bad_tool", "connection refused")
+            .await
+            .expect("record 1");
+        db.record_tool_failure("bad_tool", "timeout")
+            .await
+            .expect("record 2");
+        db.record_tool_failure("bad_tool", "parse error")
+            .await
+            .expect("record 3");
+
+        // Get broken tools (threshold = 2, should include bad_tool with 3 failures)
+        let broken = db.get_broken_tools(2).await.expect("get broken");
+        assert!(!broken.is_empty());
+        let found = broken.iter().find(|b| b.name == "bad_tool");
+        assert!(found.is_some(), "bad_tool should be in broken tools list");
+
+        // Mark as repaired
+        db.mark_tool_repaired("bad_tool")
+            .await
+            .expect("mark repaired");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_routine_crud() {
+        use crate::agent::routine::{
+            NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RoutineRun, RunStatus, Trigger,
+        };
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let routine_id = uuid::Uuid::new_v4();
+        let routine = Routine {
+            id: routine_id,
+            name: "test-routine".to_string(),
+            description: "A test routine".to_string(),
+            user_id: "user1".to_string(),
+            enabled: true,
+            trigger: Trigger::Cron {
+                schedule: "0 * * * *".to_string(),
+            },
+            action: RoutineAction::Lightweight {
+                prompt: "Check status".to_string(),
+                context_paths: vec![],
+                max_tokens: 500,
+            },
+            guardrails: RoutineGuardrails {
+                cooldown: std::time::Duration::from_secs(60),
+                max_concurrent: 1,
+                dedup_window: None,
+            },
+            notify: NotifyConfig {
+                channel: None,
+                user: "user1".to_string(),
+                on_attention: true,
+                on_failure: true,
+                on_success: false,
+            },
+            last_run_at: None,
+            next_fire_at: None,
+            run_count: 0,
+            consecutive_failures: 0,
+            state: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        // Create
+        db.create_routine(&routine).await.expect("create routine");
+
+        // Get by ID
+        let fetched = db
+            .get_routine(routine_id)
+            .await
+            .expect("get routine")
+            .expect("should exist");
+        assert_eq!(fetched.name, "test-routine");
+        assert!(fetched.enabled);
+
+        // Get by name
+        let by_name = db
+            .get_routine_by_name("user1", "test-routine")
+            .await
+            .expect("get by name")
+            .expect("should exist");
+        assert_eq!(by_name.id, routine_id);
+
+        // List routines for user
+        let list = db.list_routines("user1").await.expect("list routines");
+        assert_eq!(list.len(), 1);
+
+        // List all routines
+        let all = db.list_all_routines().await.expect("list all");
+        assert!(!all.is_empty());
+
+        // Update routine (disable + change description)
+        let mut updated = fetched;
+        updated.enabled = false;
+        updated.description = "Updated description".to_string();
+        db.update_routine(&updated).await.expect("update routine");
+
+        let re_fetched = db
+            .get_routine(routine_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(!re_fetched.enabled);
+        assert_eq!(re_fetched.description, "Updated description");
+
+        // Create a routine run
+        let run_id = uuid::Uuid::new_v4();
+        let run = RoutineRun {
+            id: run_id,
+            routine_id,
+            trigger_type: "cron".to_string(),
+            trigger_detail: Some("0 * * * *".to_string()),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            status: RunStatus::Running,
+            result_summary: None,
+            tokens_used: None,
+            job_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        db.create_routine_run(&run).await.expect("create run");
+
+        // List runs
+        let runs = db
+            .list_routine_runs(routine_id, 10)
+            .await
+            .expect("list runs");
+        assert_eq!(runs.len(), 1);
+        assert!(matches!(runs[0].status, RunStatus::Running));
+
+        // Complete the run
+        db.complete_routine_run(run_id, RunStatus::Ok, Some("All good"), Some(150))
+            .await
+            .expect("complete run");
+
+        let runs = db
+            .list_routine_runs(routine_id, 10)
+            .await
+            .expect("list runs after complete");
+        assert!(matches!(runs[0].status, RunStatus::Ok));
+
+        // Delete
+        let deleted = db.delete_routine(routine_id).await.expect("delete");
+        assert!(deleted);
+
+        // Delete non-existent
+        let deleted = db.delete_routine(routine_id).await.expect("delete again");
+        assert!(!deleted);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_routine_runtime_update() {
+        use crate::agent::routine::{
+            NotifyConfig, Routine, RoutineAction, RoutineGuardrails, Trigger,
+        };
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let routine_id = uuid::Uuid::new_v4();
+        let routine = Routine {
+            id: routine_id,
+            name: "runtime-test".to_string(),
+            description: "Test runtime update".to_string(),
+            user_id: "user1".to_string(),
+            enabled: true,
+            trigger: Trigger::Manual,
+            action: RoutineAction::Lightweight {
+                prompt: "test".to_string(),
+                context_paths: vec![],
+                max_tokens: 100,
+            },
+            guardrails: RoutineGuardrails {
+                cooldown: std::time::Duration::from_secs(0),
+                max_concurrent: 1,
+                dedup_window: None,
+            },
+            notify: NotifyConfig {
+                channel: None,
+                user: "user1".to_string(),
+                on_attention: false,
+                on_failure: false,
+                on_success: false,
+            },
+            last_run_at: None,
+            next_fire_at: None,
+            run_count: 0,
+            consecutive_failures: 0,
+            state: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db.create_routine(&routine).await.expect("create");
+
+        let now = chrono::Utc::now();
+        db.update_routine_runtime(
+            routine_id,
+            now,
+            Some(now + chrono::TimeDelta::seconds(3600)),
+            5,
+            2,
+            &serde_json::json!({"last_result": "ok"}),
+        )
+        .await
+        .expect("update runtime");
+
+        let fetched = db
+            .get_routine(routine_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.run_count, 5);
+        assert_eq!(fetched.consecutive_failures, 2);
+        assert!(fetched.last_run_at.is_some());
+        assert!(fetched.next_fire_at.is_some());
+
+        // Cleanup
+        db.delete_routine(routine_id).await.expect("delete");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_llm_call_recording() {
+        use crate::history::LlmCallRecord;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let record = LlmCallRecord {
+            job_id: None,
+            conversation_id: None,
+            provider: "openai",
+            model: "gpt-4",
+            input_tokens: 100,
+            output_tokens: 50,
+            cost: Decimal::new(5, 3), // 0.005
+            purpose: Some("test"),
+        };
+
+        let call_id = db.record_llm_call(&record).await.expect("record llm call");
+        assert!(!call_id.is_nil());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_sandbox_job_lifecycle() {
+        use crate::history::SandboxJobRecord;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let job_id = uuid::Uuid::new_v4();
+        let job = SandboxJobRecord {
+            id: job_id,
+            task: "Build a test tool".to_string(),
+            status: "creating".to_string(),
+            user_id: "user1".to_string(),
+            project_dir: "/workspace/test".to_string(),
+            success: None,
+            failure_reason: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            credential_grants_json: "[]".to_string(),
+        };
+
+        // Create
+        db.save_sandbox_job(&job).await.expect("save sandbox job");
+
+        // Get
+        let fetched = db
+            .get_sandbox_job(job_id)
+            .await
+            .expect("get")
+            .expect("should exist");
+        assert_eq!(fetched.task, "Build a test tool");
+        assert_eq!(fetched.status, "creating");
+
+        // Update status to running
+        db.update_sandbox_job_status(
+            job_id,
+            "running",
+            None,
+            None,
+            Some(chrono::Utc::now()),
+            None,
+        )
+        .await
+        .expect("update to running");
+
+        // Update to completed
+        db.update_sandbox_job_status(
+            job_id,
+            "completed",
+            Some(true),
+            Some("Done"),
+            None,
+            Some(chrono::Utc::now()),
+        )
+        .await
+        .expect("update to completed");
+
+        let fetched = db
+            .get_sandbox_job(job_id)
+            .await
+            .expect("get")
+            .expect("should exist");
+        assert_eq!(fetched.status, "completed");
+        assert_eq!(fetched.success, Some(true));
+
+        // List
+        let all = db.list_sandbox_jobs().await.expect("list");
+        assert!(!all.is_empty());
+
+        // Summary
+        let summary = db.sandbox_job_summary().await.expect("summary");
+        assert!(summary.total >= 1);
+
+        // Per-user list
+        let user_jobs = db
+            .list_sandbox_jobs_for_user("user1")
+            .await
+            .expect("user list");
+        assert!(!user_jobs.is_empty());
+
+        // Ownership check
+        let belongs = db
+            .sandbox_job_belongs_to_user(job_id, "user1")
+            .await
+            .expect("belongs check");
+        assert!(belongs);
+        let not_belongs = db
+            .sandbox_job_belongs_to_user(job_id, "other_user")
+            .await
+            .expect("belongs check");
+        assert!(!not_belongs);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_sandbox_job_mode() {
+        use crate::history::SandboxJobRecord;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let job_id = uuid::Uuid::new_v4();
+        let job = SandboxJobRecord {
+            id: job_id,
+            task: "Mode test".to_string(),
+            status: "creating".to_string(),
+            user_id: "user1".to_string(),
+            project_dir: "/workspace".to_string(),
+            success: None,
+            failure_reason: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            credential_grants_json: "[]".to_string(),
+        };
+        db.save_sandbox_job(&job).await.expect("save");
+
+        // Default mode
+        let mode = db.get_sandbox_job_mode(job_id).await.expect("get mode");
+        // Default is "worker" per schema or NULL
+        assert!(mode.is_none() || mode.as_deref() == Some("worker"));
+
+        // Update mode
+        db.update_sandbox_job_mode(job_id, "claude_code")
+            .await
+            .expect("update mode");
+        let mode = db
+            .get_sandbox_job_mode(job_id)
+            .await
+            .expect("get mode")
+            .expect("should have mode");
+        assert_eq!(mode, "claude_code");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_job_events() {
+        use crate::history::SandboxJobRecord;
+
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        // Create a sandbox job first (foreign key)
+        let job_id = uuid::Uuid::new_v4();
+        let job = SandboxJobRecord {
+            id: job_id,
+            task: "Event test".to_string(),
+            status: "running".to_string(),
+            user_id: "user1".to_string(),
+            project_dir: "/workspace".to_string(),
+            success: None,
+            failure_reason: None,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            completed_at: None,
+            credential_grants_json: "[]".to_string(),
+        };
+        db.save_sandbox_job(&job).await.expect("save job");
+
+        // Save events
+        db.save_job_event(
+            job_id,
+            "tool_call",
+            &serde_json::json!({"tool": "shell", "args": {"command": "ls"}}),
+        )
+        .await
+        .expect("save event 1");
+
+        db.save_job_event(
+            job_id,
+            "tool_result",
+            &serde_json::json!({"output": "file1.txt\nfile2.txt"}),
+        )
+        .await
+        .expect("save event 2");
+
+        db.save_job_event(
+            job_id,
+            "llm_response",
+            &serde_json::json!({"content": "Found 2 files"}),
+        )
+        .await
+        .expect("save event 3");
+
+        // List all events
+        let events = db.list_job_events(job_id, None).await.expect("list events");
+        assert_eq!(events.len(), 3);
+
+        // List with limit
+        let events = db
+            .list_job_events(job_id, Some(2))
+            .await
+            .expect("list events limited");
+        assert_eq!(events.len(), 2);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_estimation_snapshot_round_trip() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        // Create a job first
+        let job_ctx = crate::context::JobContext::with_user("user1", "Estimate test", "testing");
+        let job_id = job_ctx.job_id;
+        db.save_job(&job_ctx).await.expect("save job");
+
+        // Save estimation snapshot
+        let snap_id = db
+            .save_estimation_snapshot(
+                job_id,
+                "code_generation",
+                &["shell".to_string(), "write_file".to_string()],
+                Decimal::new(50, 2), // 0.50
+                120,
+                Decimal::new(500, 2), // 5.00
+            )
+            .await
+            .expect("save snapshot");
+        assert!(!snap_id.is_nil());
+
+        // Update with actuals
+        db.update_estimation_actuals(
+            snap_id,
+            Decimal::new(45, 2), // 0.45
+            110,
+            Some(Decimal::new(600, 2)), // 6.00
+        )
+        .await
+        .expect("update actuals");
     }
 }

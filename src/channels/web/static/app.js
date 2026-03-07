@@ -16,6 +16,31 @@ let pairingPollInterval = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 
+// --- Slash Commands ---
+
+const SLASH_COMMANDS = [
+  { cmd: '/status',     desc: 'Show all jobs, or /status <id> for one job' },
+  { cmd: '/list',       desc: 'List all jobs' },
+  { cmd: '/cancel',     desc: '/cancel <job-id> — cancel a running job' },
+  { cmd: '/undo',       desc: 'Revert the last turn' },
+  { cmd: '/redo',       desc: 'Re-apply an undone turn' },
+  { cmd: '/compact',    desc: 'Compress the context window' },
+  { cmd: '/clear',      desc: 'Clear thread and start fresh' },
+  { cmd: '/interrupt',  desc: 'Stop the current turn' },
+  { cmd: '/heartbeat',  desc: 'Trigger manual heartbeat check' },
+  { cmd: '/summarize',  desc: 'Summarize the current thread' },
+  { cmd: '/suggest',    desc: 'Suggest next steps' },
+  { cmd: '/help',       desc: 'Show help' },
+  { cmd: '/version',    desc: 'Show version info' },
+  { cmd: '/tools',      desc: 'List available tools' },
+  { cmd: '/skills',     desc: 'List installed skills' },
+  { cmd: '/model',      desc: 'Show or switch the LLM model' },
+  { cmd: '/thread new', desc: 'Create a new conversation thread' },
+];
+
+let _slashSelected = -1;
+let _slashMatches = [];
+
 // --- Tool Activity State ---
 let _activeGroup = null;
 let _activeToolCards = {};
@@ -108,6 +133,110 @@ function apiFetch(path, options) {
   });
 }
 
+// --- Restart Feature ---
+
+let isRestarting = false; // Track if we're currently restarting
+let restartEnabled = false; // Track if restart is available in this deployment
+
+function triggerRestart() {
+  if (!currentThreadId) {
+    alert('Please start a conversation first');
+    return;
+  }
+
+  // Show the confirmation modal
+  const confirmModal = document.getElementById('restart-confirm-modal');
+  confirmModal.style.display = 'flex';
+}
+
+function confirmRestart() {
+  if (!currentThreadId) {
+    alert('Please start a conversation first');
+    return;
+  }
+
+  // Hide confirmation modal
+  const confirmModal = document.getElementById('restart-confirm-modal');
+  confirmModal.style.display = 'none';
+
+  const restartBtn = document.getElementById('restart-btn');
+  const restartIcon = document.getElementById('restart-icon');
+
+  // Mark as restarting
+  isRestarting = true;
+  restartBtn.disabled = true;
+  if (restartIcon) restartIcon.classList.add('spinning');
+
+  // Show progress modal
+  const loaderEl = document.getElementById('restart-loader');
+  loaderEl.style.display = 'flex';
+
+  // Send restart command via chat
+  console.log('[confirmRestart] Sending /restart command to server');
+  apiFetch('/api/chat/send', {
+    method: 'POST',
+    body: {
+      content: '/restart',
+      thread_id: currentThreadId,
+    },
+  })
+    .then((response) => {
+      console.log('[confirmRestart] API call succeeded, response:', response);
+    })
+    .catch((err) => {
+      console.error('[confirmRestart] Restart request failed:', err);
+      addMessage('system', 'Restart failed: ' + err.message);
+      isRestarting = false;
+      restartBtn.disabled = false;
+      if (restartIcon) restartIcon.classList.remove('spinning');
+      loaderEl.style.display = 'none';
+    });
+}
+
+function cancelRestart() {
+  const confirmModal = document.getElementById('restart-confirm-modal');
+  confirmModal.style.display = 'none';
+}
+
+function tryShowRestartModal() {
+  // Defensive callback for when restart is detected in messages.
+  if (!isRestarting) {
+    isRestarting = true;
+    const restartBtn = document.getElementById('restart-btn');
+    const restartIcon = document.getElementById('restart-icon');
+    restartBtn.disabled = true;
+    if (restartIcon) restartIcon.classList.add('spinning');
+
+    // Show progress modal
+    const loaderEl = document.getElementById('restart-loader');
+    loaderEl.style.display = 'flex';
+  }
+}
+
+function updateRestartButtonVisibility() {
+  const restartBtn = document.getElementById('restart-btn');
+  if (restartBtn) {
+    restartBtn.style.display = restartEnabled ? 'block' : 'none';
+  }
+}
+
+function startGatewayStatusPolling() {
+  fetchGatewayStatus();
+  // Poll every 5 seconds
+  setInterval(fetchGatewayStatus, 5000);
+}
+
+function fetchGatewayStatus() {
+  apiFetch('/api/gateway/status')
+    .then((data) => {
+      restartEnabled = data.restart_enabled || false;
+      updateRestartButtonVisibility();
+    })
+    .catch((err) => {
+      console.warn('[gateway status] Failed to fetch:', err);
+    });
+}
+
 // --- SSE ---
 
 function connectSSE() {
@@ -118,6 +247,18 @@ function connectSSE() {
   eventSource.onopen = () => {
     document.getElementById('sse-dot').classList.remove('disconnected');
     document.getElementById('sse-status').textContent = 'Connected';
+
+    // If we were restarting, close the modal and reset button now that server is back
+    if (isRestarting) {
+      const loaderEl = document.getElementById('restart-loader');
+      if (loaderEl) loaderEl.style.display = 'none';
+      const restartBtn = document.getElementById('restart-btn');
+      const restartIcon = document.getElementById('restart-icon');
+      if (restartBtn) restartBtn.disabled = false;
+      if (restartIcon) restartIcon.classList.remove('spinning');
+      isRestarting = false;
+    }
+
     if (sseHasConnectedBefore && currentThreadId) {
       finalizeActivityGroup();
       loadHistory();
@@ -135,10 +276,14 @@ function connectSSE() {
     if (!isCurrentThread(data.thread_id)) return;
     finalizeActivityGroup();
     addMessage('assistant', data.content);
-    setStatus('');
     enableChatInput();
     // Refresh thread list so new titles appear after first message
     loadThreads();
+
+    // Show restart modal if the response indicates restart was initiated
+    if (data.content && data.content.toLowerCase().includes('restart initiated')) {
+      setTimeout(() => tryShowRestartModal(), 500);
+    }
   });
 
   eventSource.addEventListener('thinking', (e) => {
@@ -156,7 +301,12 @@ function connectSSE() {
   eventSource.addEventListener('tool_completed', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    completeToolCard(data.name, data.success);
+    completeToolCard(data.name, data.success, data.error, data.parameters);
+
+    // Show restart modal only when the restart tool succeeds
+    if (data.name.toLowerCase() === 'restart' && data.success) {
+      setTimeout(() => tryShowRestartModal(), 500);
+    }
   });
 
   eventSource.addEventListener('tool_result', (e) => {
@@ -175,10 +325,10 @@ function connectSSE() {
   eventSource.addEventListener('status', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    setStatus(data.message);
     // "Done" and "Awaiting approval" are terminal signals from the agent:
     // the agentic loop finished, so re-enable input as a safety net in case
     // the response SSE event is empty or lost.
+    // Status text is not displayed — inline activity cards handle visual feedback.
     if (data.message === 'Done' || data.message === 'Awaiting approval') {
       finalizeActivityGroup();
       enableChatInput();
@@ -198,13 +348,24 @@ function connectSSE() {
 
   eventSource.addEventListener('auth_required', (e) => {
     const data = JSON.parse(e.data);
-    showAuthCard(data);
+    if (data.auth_url) {
+      // OAuth flow: show the auth card with an OAuth button + optional token paste field.
+      showAuthCard(data);
+    } else {
+      // Setup flow: fetch the extension's credential schema and show the multi-field
+      // configure modal (the same UI used by the Extensions tab "Setup" button).
+      showConfigureModal(data.extension_name);
+    }
   });
 
   eventSource.addEventListener('auth_completed', (e) => {
     const data = JSON.parse(e.data);
+    // Dismiss whichever UI path was active: auth card (OAuth) or configure modal (setup).
     removeAuthCard(data.extension_name);
-    showToast(data.message, 'success');
+    closeConfigureModal();
+    showToast(data.message, data.success ? 'success' : 'error');
+    // Refresh extensions list so status indicators update
+    if (currentTab === 'extensions') loadExtensions();
     enableChatInput();
   });
 
@@ -264,10 +425,8 @@ function isCurrentThread(threadId) {
 
 function sendMessage() {
   const input = document.getElementById('chat-input');
-  const sendBtn = document.getElementById('send-btn');
   if (!currentThreadId) {
     console.warn('sendMessage: no thread selected, ignoring');
-    setStatus('Waiting for thread to load...');
     return;
   }
   const content = input.value.trim();
@@ -276,27 +435,82 @@ function sendMessage() {
   addMessage('user', content);
   input.value = '';
   autoResizeTextarea(input);
-  sendBtn.disabled = true;
-  input.disabled = true;
+  input.focus();
 
   apiFetch('/api/chat/send', {
     method: 'POST',
     body: { content, thread_id: currentThreadId || undefined },
   }).catch((err) => {
     addMessage('system', 'Failed to send: ' + err.message);
-    setStatus('');
-    enableChatInput();
   });
 }
 
 function enableChatInput() {
-  // Don't re-enable until a thread is selected (prevents orphan messages)
-  if (!currentThreadId) return;
+  // no-op: input and send button are always enabled
+}
+
+// --- Slash Autocomplete ---
+
+function showSlashAutocomplete(matches) {
+  const el = document.getElementById('slash-autocomplete');
+  if (!el || matches.length === 0) { hideSlashAutocomplete(); return; }
+  _slashMatches = matches;
+  _slashSelected = -1;
+  el.innerHTML = '';
+  matches.forEach((item, i) => {
+    const row = document.createElement('div');
+    row.className = 'slash-ac-item';
+    row.dataset.index = i;
+    var cmdSpan = document.createElement('span');
+    cmdSpan.className = 'slash-ac-cmd';
+    cmdSpan.textContent = item.cmd;
+    var descSpan = document.createElement('span');
+    descSpan.className = 'slash-ac-desc';
+    descSpan.textContent = item.desc;
+    row.appendChild(cmdSpan);
+    row.appendChild(descSpan);
+    row.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // prevent blur
+      selectSlashItem(item.cmd);
+    });
+    el.appendChild(row);
+  });
+  el.style.display = 'block';
+}
+
+function hideSlashAutocomplete() {
+  const el = document.getElementById('slash-autocomplete');
+  if (el) el.style.display = 'none';
+  _slashSelected = -1;
+  _slashMatches = [];
+}
+
+function selectSlashItem(cmd) {
   const input = document.getElementById('chat-input');
-  const sendBtn = document.getElementById('send-btn');
-  sendBtn.disabled = false;
-  input.disabled = false;
+  input.value = cmd + ' ';
   input.focus();
+  hideSlashAutocomplete();
+  autoResizeTextarea(input);
+}
+
+function updateSlashHighlight() {
+  const items = document.querySelectorAll('#slash-autocomplete .slash-ac-item');
+  items.forEach((el, i) => el.classList.toggle('selected', i === _slashSelected));
+  if (_slashSelected >= 0 && items[_slashSelected]) {
+    items[_slashSelected].scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function filterSlashCommands(value) {
+  if (!value.startsWith('/')) { hideSlashAutocomplete(); return; }
+  // Only show autocomplete when the input is just a slash command prefix (no spaces except /thread new)
+  const lower = value.toLowerCase();
+  const matches = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(lower));
+  if (matches.length === 0 || (matches.length === 1 && matches[0].cmd === lower.trimEnd())) {
+    hideSlashAutocomplete();
+  } else {
+    showSlashAutocomplete(matches);
+  }
 }
 
 function sendApprovalAction(requestId, action) {
@@ -320,6 +534,8 @@ function sendApprovalAction(requestId, action) {
     const labelText = action === 'approve' ? 'Approved' : action === 'always' ? 'Always approved' : 'Denied';
     label.textContent = labelText;
     actions.appendChild(label);
+    // Remove the card after showing the confirmation briefly
+    setTimeout(() => { card.remove(); }, 1500);
   }
 }
 
@@ -393,15 +609,6 @@ function appendToLastAssistant(chunk) {
   } else {
     addMessage('assistant', chunk);
   }
-}
-
-function setStatus(text) {
-  const el = document.getElementById('chat-status');
-  if (!text) {
-    el.innerHTML = '';
-    return;
-  }
-  el.innerHTML = escapeHtml(text);
 }
 
 // --- Inline Tool Activity Cards ---
@@ -514,7 +721,7 @@ function addToolCard(name) {
   container.scrollTop = container.scrollHeight;
 }
 
-function completeToolCard(name, success) {
+function completeToolCard(name, success, error, parameters) {
   const entries = _activeToolCards[name];
   if (!entries || entries.length === 0) return;
   // Find first running card
@@ -535,6 +742,27 @@ function completeToolCard(name, success) {
     ? '<span class="activity-icon-success">&#10003;</span>'
     : '<span class="activity-icon-fail">&#10007;</span>';
   entry.card.setAttribute('data-status', success ? 'success' : 'fail');
+
+  // For failed tools, populate the body with error details and auto-expand
+  if (!success && (error || parameters)) {
+    const output = entry.card.querySelector('.activity-tool-output');
+    if (output) {
+      let detail = '';
+      if (parameters) {
+        detail += 'Input:\n' + parameters + '\n\n';
+      }
+      if (error) {
+        detail += 'Error:\n' + error;
+      }
+      output.textContent = detail;
+
+      // Auto-expand so the error is immediately visible
+      const body = entry.card.querySelector('.activity-tool-body');
+      const chevron = entry.card.querySelector('.activity-tool-chevron');
+      if (body) body.style.display = 'block';
+      if (chevron) chevron.classList.add('expanded');
+    }
+  }
 }
 
 function setToolCardOutput(name, preview) {
@@ -775,7 +1003,7 @@ function showAuthCard(data) {
     oauthBtn.className = 'auth-oauth';
     oauthBtn.textContent = 'Authenticate with ' + data.extension_name;
     oauthBtn.addEventListener('click', () => {
-      window.open(data.auth_url, '_blank', 'width=600,height=700');
+      openOAuthUrl(data.auth_url);
     });
     links.appendChild(oauthBtn);
   }
@@ -798,7 +1026,7 @@ function showAuthCard(data) {
 
   const tokenInput = document.createElement('input');
   tokenInput.type = 'password';
-  tokenInput.placeholder = 'Paste your API key or token';
+  tokenInput.placeholder = data.instructions || 'Paste your API key or token';
   tokenInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value);
   });
@@ -907,9 +1135,21 @@ function loadHistory(before) {
       container.innerHTML = '';
       for (const turn of data.turns) {
         addMessage('user', turn.user_input);
+        if (turn.tool_calls && turn.tool_calls.length > 0) {
+          addToolCallsSummary(turn.tool_calls);
+        }
         if (turn.response) {
           addMessage('assistant', turn.response);
         }
+      }
+      // Show processing indicator if the last turn is still in-progress
+      var lastTurn = data.turns.length > 0 ? data.turns[data.turns.length - 1] : null;
+      if (lastTurn && !lastTurn.response && lastTurn.state === 'Processing') {
+        showActivityThinking('Processing...');
+      }
+      // Re-render pending approval card if the thread is awaiting approval
+      if (data.pending_approval) {
+        showApproval(data.pending_approval);
       }
     } else {
       // Pagination: prepend older messages
@@ -918,6 +1158,9 @@ function loadHistory(before) {
       for (const turn of data.turns) {
         const userDiv = createMessageElement('user', turn.user_input);
         fragment.appendChild(userDiv);
+        if (turn.tool_calls && turn.tool_calls.length > 0) {
+          fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
+        }
         if (turn.response) {
           const assistantDiv = createMessageElement('assistant', turn.response);
           fragment.appendChild(assistantDiv);
@@ -948,6 +1191,61 @@ function createMessageElement(role, content) {
     div.setAttribute('data-raw', content);
     div.innerHTML = renderMarkdown(content);
   }
+  return div;
+}
+
+function addToolCallsSummary(toolCalls) {
+  const container = document.getElementById('chat-messages');
+  container.appendChild(createToolCallsSummaryElement(toolCalls));
+  container.scrollTop = container.scrollHeight;
+}
+
+function createToolCallsSummaryElement(toolCalls) {
+  const div = document.createElement('div');
+  div.className = 'tool-calls-summary';
+
+  const header = document.createElement('div');
+  header.className = 'tool-calls-header';
+  header.textContent = toolCalls.length + ' tool' + (toolCalls.length !== 1 ? 's' : '') + ' used';
+  div.appendChild(header);
+
+  const list = document.createElement('div');
+  list.className = 'tool-calls-list';
+
+  for (const tc of toolCalls) {
+    const item = document.createElement('div');
+    item.className = 'tool-call-item' + (tc.has_error ? ' tool-error' : '');
+
+    const icon = tc.has_error ? '\u2717' : '\u2713';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'tool-call-name';
+    nameSpan.textContent = icon + ' ' + tc.name;
+    item.appendChild(nameSpan);
+
+    if (tc.result_preview) {
+      const preview = document.createElement('div');
+      preview.className = 'tool-call-preview';
+      preview.textContent = tc.result_preview;
+      item.appendChild(preview);
+    }
+    if (tc.error) {
+      const errDiv = document.createElement('div');
+      errDiv.className = 'tool-call-error-text';
+      errDiv.textContent = tc.error;
+      item.appendChild(errDiv);
+    }
+
+    list.appendChild(item);
+  }
+
+  div.appendChild(list);
+
+  header.style.cursor = 'pointer';
+  header.addEventListener('click', () => {
+    list.classList.toggle('expanded');
+    header.classList.toggle('expanded');
+  });
+
   return div;
 }
 
@@ -1026,7 +1324,6 @@ function createNewThread() {
   apiFetch('/api/chat/thread/new', { method: 'POST' }).then((data) => {
     currentThreadId = data.id || null;
     document.getElementById('chat-messages').innerHTML = '';
-    setStatus('');
     loadThreads();
   }).catch((err) => {
     showToast('Failed to create thread: ' + err.message, 'error');
@@ -1043,16 +1340,50 @@ function toggleThreadSidebar() {
 // Chat input auto-resize and keyboard handling
 const chatInput = document.getElementById('chat-input');
 chatInput.addEventListener('keydown', (e) => {
+  const acEl = document.getElementById('slash-autocomplete');
+  const acVisible = acEl && acEl.style.display !== 'none';
+
+  if (acVisible) {
+    const items = acEl.querySelectorAll('.slash-ac-item');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      _slashSelected = Math.min(_slashSelected + 1, items.length - 1);
+      updateSlashHighlight();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      _slashSelected = Math.max(_slashSelected - 1, -1);
+      updateSlashHighlight();
+      return;
+    }
+    if (e.key === 'Tab' || e.key === 'Enter') {
+      e.preventDefault();
+      const pick = _slashSelected >= 0 ? _slashMatches[_slashSelected] : _slashMatches[0];
+      if (pick) selectSlashItem(pick.cmd);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      hideSlashAutocomplete();
+      return;
+    }
+  }
+
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
+    hideSlashAutocomplete();
     sendMessage();
   }
 });
-chatInput.addEventListener('input', () => autoResizeTextarea(chatInput));
-
-// Disable send until a thread is selected (loadThreads will enable it)
-chatInput.disabled = true;
-document.getElementById('send-btn').disabled = true;
+chatInput.addEventListener('input', () => {
+  autoResizeTextarea(chatInput);
+  filterSlashCommands(chatInput.value);
+});
+chatInput.addEventListener('blur', () => {
+  // Small delay so mousedown on autocomplete item fires first
+  setTimeout(hideSlashAutocomplete, 150);
+});
 
 // Infinite scroll: load older messages when scrolled near the top
 document.getElementById('chat-messages').addEventListener('scroll', function () {
@@ -1283,7 +1614,9 @@ function buildBreadcrumb(path) {
   let current = '';
   for (const part of parts) {
     current += (current ? '/' : '') + part;
-    html += ' / <a onclick="readMemoryFile(\'' + escapeHtml(current) + '\')">' + escapeHtml(part) + '</a>';
+    // Store the path in data-path (HTML-escaped) and read it back via this.dataset.path
+    // to avoid single-quote injection in inline JS string literals.
+    html += ' / <a onclick="readMemoryFile(this.dataset.path)" data-path="' + escapeHtml(current) + '">' + escapeHtml(part) + '</a>';
   }
   return html;
 }
@@ -1458,10 +1791,8 @@ function applyLogFilters() {
 function setServerLogLevel(level) {
   apiFetch('/api/logs/level', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ level: level }),
+    body: { level },
   })
-    .then(r => r.json())
     .then(data => {
       document.getElementById('logs-server-level').value = data.level;
     })
@@ -1470,7 +1801,6 @@ function setServerLogLevel(level) {
 
 function loadServerLogLevel() {
   apiFetch('/api/logs/level')
-    .then(r => r.json())
     .then(data => {
       document.getElementById('logs-server-level').value = data.level;
     })
@@ -1478,6 +1808,8 @@ function loadServerLogLevel() {
 }
 
 // --- Extensions ---
+
+var kindLabels = { 'wasm_channel': 'Channel', 'wasm_tool': 'Tool', 'mcp_server': 'MCP' };
 
 function loadExtensions() {
   const extList = document.getElementById('extensions-list');
@@ -1554,7 +1886,7 @@ function renderAvailableExtensionCard(entry) {
 
   const kind = document.createElement('span');
   kind.className = 'ext-kind kind-' + entry.kind;
-  kind.textContent = entry.kind;
+  kind.textContent = kindLabels[entry.kind] || entry.kind;
   header.appendChild(kind);
 
   card.appendChild(header);
@@ -1586,6 +1918,11 @@ function renderAvailableExtensionCard(entry) {
     }).then(function(res) {
       if (res.success) {
         showToast('Installed ' + entry.display_name, 'success');
+        // OAuth popup if auth started during install (builtin creds)
+        if (res.auth_url) {
+          showToast('Opening authentication for ' + entry.display_name, 'info');
+          openOAuthUrl(res.auth_url);
+        }
         loadExtensions();
         // Auto-open configure for WASM channels
         if (entry.kind === 'wasm_channel') {
@@ -1620,7 +1957,7 @@ function renderMcpServerCard(entry, installedExt) {
 
   var kind = document.createElement('span');
   kind.className = 'ext-kind kind-mcp_server';
-  kind.textContent = 'mcp_server';
+  kind.textContent = kindLabels['mcp_server'] || 'mcp_server';
   header.appendChild(kind);
 
   if (installedExt) {
@@ -1704,12 +2041,12 @@ function renderExtensionCard(ext) {
 
   const name = document.createElement('span');
   name.className = 'ext-name';
-  name.textContent = ext.name;
+  name.textContent = ext.display_name || ext.name;
   header.appendChild(name);
 
   const kind = document.createElement('span');
   kind.className = 'ext-kind kind-' + ext.kind;
-  kind.textContent = ext.kind;
+  kind.textContent = kindLabels[ext.kind] || ext.kind;
   header.appendChild(kind);
 
   // Auth dot only for non-WASM-channel extensions (channels use the stepper instead)
@@ -1742,7 +2079,7 @@ function renderExtensionCard(ext) {
     card.appendChild(url);
   }
 
-  if (ext.tools.length > 0) {
+  if (ext.tools && ext.tools.length > 0) {
     const tools = document.createElement('div');
     tools.className = 'ext-tools';
     tools.textContent = 'Tools: ' + ext.tools.join(', ');
@@ -1757,14 +2094,6 @@ function renderExtensionCard(ext) {
     card.appendChild(errorDiv);
   }
 
-  // Show "coming soon" note for non-Telegram channels that are configured but not fully supported yet
-  if (ext.kind === 'wasm_channel' && ext.name !== 'telegram'
-      && (ext.activation_status === 'configured' || ext.active)) {
-    const noteDiv = document.createElement('div');
-    noteDiv.className = 'ext-note';
-    noteDiv.textContent = 'Full integration coming soon. Use the CLI to complete setup.';
-    card.appendChild(noteDiv);
-  }
 
   const actions = document.createElement('div');
   actions.className = 'ext-actions';
@@ -1785,11 +2114,6 @@ function renderExtensionCard(ext) {
       actions.appendChild(pairingLabel);
       actions.appendChild(createReconfigureButton(ext.name));
     } else if (status === 'failed') {
-      var restartBtn = document.createElement('button');
-      restartBtn.className = 'btn-ext activate';
-      restartBtn.textContent = 'Restart';
-      restartBtn.addEventListener('click', restartGateway);
-      actions.appendChild(restartBtn);
       actions.appendChild(createReconfigureButton(ext.name));
     } else {
       // installed or configured: show Setup button
@@ -1800,21 +2124,26 @@ function renderExtensionCard(ext) {
       actions.appendChild(setupBtn);
     }
   } else {
-    // Non-WASM-channel extensions: original behavior
-    if (!ext.active) {
+    // WASM tools / MCP servers
+    const activeLabel = document.createElement('span');
+    activeLabel.className = 'ext-active-label';
+    activeLabel.textContent = ext.active ? 'Active' : 'Installed';
+    actions.appendChild(activeLabel);
+
+    // MCP servers may be installed but inactive — show Activate button
+    if (ext.kind === 'mcp_server' && !ext.active) {
       const activateBtn = document.createElement('button');
       activateBtn.className = 'btn-ext activate';
       activateBtn.textContent = 'Activate';
       activateBtn.addEventListener('click', () => activateExtension(ext.name));
       actions.appendChild(activateBtn);
-    } else {
-      const activeLabel = document.createElement('span');
-      activeLabel.className = 'ext-active-label';
-      activeLabel.textContent = 'Active';
-      actions.appendChild(activeLabel);
     }
 
-    if (ext.needs_setup) {
+    // Show Configure/Reconfigure button when there are secrets to enter.
+    // Skip when has_auth is true but needs_setup is false and not yet authenticated —
+    // this means OAuth credentials resolve automatically (builtin/env) and the user
+    // just needs to complete the OAuth flow, not fill in a config form.
+    if (ext.needs_setup || (ext.has_auth && ext.authenticated)) {
       const configBtn = document.createElement('button');
       configBtn.className = 'btn-ext configure';
       configBtn.textContent = ext.authenticated ? 'Reconfigure' : 'Configure';
@@ -1847,13 +2176,18 @@ function activateExtension(name) {
   apiFetch('/api/extensions/' + encodeURIComponent(name) + '/activate', { method: 'POST' })
     .then((res) => {
       if (res.success) {
+        // Even on success, the tool may need OAuth (e.g., WASM loaded but no token yet)
+        if (res.auth_url) {
+          showToast('Opening authentication for ' + name, 'info');
+          openOAuthUrl(res.auth_url);
+        }
         loadExtensions();
         return;
       }
 
       if (res.auth_url) {
         showToast('Opening authentication for ' + name, 'info');
-        window.open(res.auth_url, '_blank');
+        openOAuthUrl(res.auth_url);
       } else if (res.awaiting_token) {
         showConfigureModal(name);
       } else {
@@ -1938,7 +2272,8 @@ function renderConfigureModal(name, secrets) {
     if (secret.provided) {
       const badge = document.createElement('span');
       badge.className = 'field-provided';
-      badge.textContent = 'Set';
+      badge.textContent = '\u2713';
+      badge.title = 'Already configured';
       inputRow.appendChild(badge);
     }
     if (secret.auto_generate && !secret.provided) {
@@ -1994,21 +2329,22 @@ function submitConfigureModal(name, fields) {
     body: { secrets },
   })
     .then((res) => {
-      closeConfigureModal();
       if (res.success) {
-        if (res.activated && name === 'telegram') {
-          showToast('Configured and activated ' + name, 'success');
-        } else if (res.activated) {
-          showToast('Configured ' + name + ' successfully', 'success');
-        } else if (res.needs_restart) {
-          showToast('Configured ' + name + '. Restart required to activate.', 'info');
-        } else {
-          showToast(res.message, 'success');
+        closeConfigureModal();
+        if (res.auth_url) {
+          // OAuth flow started — open consent popup. The auth_completed SSE will
+          // not arrive immediately (it fires after OAuth callback), so show a toast now.
+          showToast('Opening OAuth authorization for ' + name, 'info');
+          openOAuthUrl(res.auth_url);
+          loadExtensions();
         }
+        // For non-OAuth success: the server always broadcasts auth_completed SSE,
+        // which will show the toast and refresh extensions — no need to do it here too.
       } else {
+        // Keep modal open so the user can correct their input and retry.
+        btns.forEach(function(b) { b.disabled = false; });
         showToast(res.message || 'Configuration failed', 'error');
       }
-      loadExtensions();
     })
     .catch((err) => {
       btns.forEach(function(b) { b.disabled = false; });
@@ -2019,6 +2355,25 @@ function submitConfigureModal(name, fields) {
 function closeConfigureModal() {
   const existing = document.querySelector('.configure-overlay');
   if (existing) existing.remove();
+}
+
+// Validate that a server-supplied OAuth URL is HTTPS before opening a popup.
+// Rejects javascript:, data:, and other non-HTTPS schemes to prevent URL-injection.
+// Uses the URL constructor to safely parse and validate the scheme, which also
+// handles non-string values (objects, null, etc.) that would throw on .startsWith().
+function openOAuthUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+    if (parsed.protocol !== 'https:') {
+      throw new Error('non-HTTPS protocol: ' + parsed.protocol);
+    }
+  } catch (e) {
+    console.warn('Blocked invalid/non-HTTPS OAuth URL:', url, e.message);
+    showToast('Invalid OAuth URL returned by server', 'error');
+    return;
+  }
+  window.open(parsed.href, '_blank', 'width=600,height=700');
 }
 
 // --- Pairing ---
@@ -2067,7 +2422,7 @@ function approvePairing(channel, code, container) {
   }).then(res => {
     if (res.success) {
       showToast('Pairing approved', 'success');
-      loadPairingRequests(channel, container);
+      loadExtensions();
     } else {
       showToast(res.message || 'Approve failed', 'error');
     }
@@ -2090,53 +2445,6 @@ function stopPairingPoll() {
   }
 }
 
-// --- Gateway restart ---
-
-function restartGateway() {
-  if (!confirm('Restart IronClaw gateway? Active connections will be dropped.')) return;
-
-  apiFetch('/api/gateway/restart', { method: 'POST' })
-    .then(function() {
-      showRestartOverlay();
-    })
-    .catch(function() {
-      showRestartOverlay();
-    });
-}
-
-function showRestartOverlay() {
-  var overlay = document.createElement('div');
-  overlay.className = 'restart-overlay';
-  overlay.innerHTML = '<div class="restart-message">'
-    + '<div class="restart-spinner"></div>'
-    + '<h2>Restarting IronClaw...</h2>'
-    + '<p>Waiting for server to come back online</p>'
-    + '</div>';
-  document.body.appendChild(overlay);
-
-  var pollCount = 0;
-  var pollTimer = setInterval(function() {
-    pollCount++;
-    if (pollCount > 30) { // 60 seconds
-      clearInterval(pollTimer);
-      overlay.querySelector('h2').textContent = 'Restart timed out';
-      overlay.querySelector('p').textContent = 'Server did not come back within 60 seconds. Check logs.';
-      overlay.querySelector('.restart-spinner').style.display = 'none';
-      return;
-    }
-    fetch('/api/gateway/status', {
-      headers: { 'Authorization': 'Bearer ' + token },
-    })
-    .then(function(r) {
-      if (r.ok) {
-        clearInterval(pollTimer);
-        window.location.reload();
-      }
-    })
-    .catch(function() { /* still restarting */ });
-  }, 2000);
-}
-
 // --- WASM channel stepper ---
 
 function renderWasmChannelStepper(ext) {
@@ -2144,23 +2452,17 @@ function renderWasmChannelStepper(ext) {
   stepper.className = 'ext-stepper';
 
   var status = ext.activation_status || 'installed';
-  var isTelegram = ext.name === 'telegram';
 
-  // Telegram gets a 3-step stepper (Installed → Configured → Active/Pairing).
-  // Other channels only get 2 steps (Installed → Configured) since full
-  // integration isn't available in the web UI yet.
   var steps = [
     { label: 'Installed', key: 'installed' },
     { label: 'Configured', key: 'configured' },
+    { label: status === 'pairing' ? 'Awaiting Pairing' : 'Active', key: 'active' },
   ];
-  if (isTelegram) {
-    steps.push({ label: status === 'pairing' ? 'Awaiting Pairing' : 'Active', key: 'active' });
-  }
 
   var reachedIdx;
-  if (status === 'active') reachedIdx = isTelegram ? 2 : 1;
+  if (status === 'active') reachedIdx = 2;
   else if (status === 'pairing') reachedIdx = 2;
-  else if (status === 'failed') reachedIdx = isTelegram ? 2 : 1;
+  else if (status === 'failed') reachedIdx = 2;
   else if (status === 'configured') reachedIdx = 1;
   else reachedIdx = 0;
 
@@ -2271,9 +2573,8 @@ function renderJobsList(jobs) {
     let actionBtns = '';
     if (job.state === 'pending' || job.state === 'in_progress') {
       actionBtns = '<button class="btn-cancel" onclick="event.stopPropagation(); cancelJob(\'' + job.id + '\')">Cancel</button>';
-    } else if (job.state === 'failed' || job.state === 'interrupted') {
-      actionBtns = '<button class="btn-restart" onclick="event.stopPropagation(); restartJob(\'' + job.id + '\')">Restart</button>';
     }
+    // Retry is only shown in the detail view where can_restart is available.
 
     return '<tr class="job-row" onclick="openJobDetail(\'' + job.id + '\')">'
       + '<td title="' + escapeHtml(job.id) + '">' + shortId + '</td>'
@@ -2302,10 +2603,12 @@ function restartJob(jobId) {
   apiFetch('/api/jobs/' + jobId + '/restart', { method: 'POST' })
     .then((res) => {
       showToast('Job restarted as ' + (res.new_job_id || '').substring(0, 8), 'success');
-      loadJobs();
     })
     .catch((err) => {
       showToast('Failed to restart job: ' + err.message, 'error');
+    })
+    .finally(() => {
+      loadJobs();
     });
 }
 
@@ -2340,8 +2643,8 @@ function renderJobDetail(job) {
     + '<h2>' + escapeHtml(job.title) + '</h2>'
     + '<span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span>';
 
-  if (job.state === 'failed' || job.state === 'interrupted') {
-    headerHtml += '<button class="btn-restart" onclick="restartJob(\'' + job.id + '\')">Restart</button>';
+  if ((job.state === 'failed' || job.state === 'interrupted') && job.can_restart === true) {
+    headerHtml += '<button class="btn-restart" onclick="restartJob(\'' + job.id + '\')">Retry</button>';
   }
   if (job.browse_url) {
     headerHtml += '<a class="btn-browse" href="' + escapeHtml(job.browse_url) + '" target="_blank">Browse Files</a>';
@@ -2588,7 +2891,7 @@ function renderJobActivity(container, job) {
   activityCurrentJobId = job ? job.id : null;
   activityRenderedLiveIndex = 0;
 
-  container.innerHTML = '<div class="activity-toolbar">'
+  let html = '<div class="activity-toolbar">'
     + '<select id="activity-type-filter">'
     + '<option value="all">All Events</option>'
     + '<option value="message">Messages</option>'
@@ -2597,12 +2900,17 @@ function renderJobActivity(container, job) {
     + '</select>'
     + '<label class="logs-checkbox"><input type="checkbox" id="activity-autoscroll" checked> Auto-scroll</label>'
     + '</div>'
-    + '<div class="activity-terminal" id="activity-terminal"></div>'
-    + '<div class="activity-input-bar" id="activity-input-bar">'
-    + '<input type="text" id="activity-prompt-input" placeholder="Send follow-up prompt..." />'
-    + '<button id="activity-send-btn">Send</button>'
-    + '<button id="activity-done-btn" title="Signal done">Done</button>'
-    + '</div>';
+    + '<div class="activity-terminal" id="activity-terminal"></div>';
+
+  if (job && job.can_prompt === true) {
+    html += '<div class="activity-input-bar" id="activity-input-bar">'
+      + '<input type="text" id="activity-prompt-input" placeholder="Send follow-up prompt..." />'
+      + '<button id="activity-send-btn">Send</button>'
+      + '<button id="activity-done-btn" title="Signal done">Done</button>'
+      + '</div>';
+  }
+
+  container.innerHTML = html;
 
   document.getElementById('activity-type-filter').addEventListener('change', applyActivityFilter);
 
@@ -2611,9 +2919,9 @@ function renderJobActivity(container, job) {
   const sendBtn = document.getElementById('activity-send-btn');
   const doneBtn = document.getElementById('activity-done-btn');
 
-  sendBtn.addEventListener('click', () => sendJobPrompt(job.id, false));
-  doneBtn.addEventListener('click', () => sendJobPrompt(job.id, true));
-  input.addEventListener('keydown', (e) => {
+  if (sendBtn) sendBtn.addEventListener('click', () => sendJobPrompt(job.id, false));
+  if (doneBtn) doneBtn.addEventListener('click', () => sendJobPrompt(job.id, true));
+  if (input) input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') sendJobPrompt(job.id, false);
   });
 
@@ -2900,7 +3208,11 @@ function renderRoutineDetail(routine) {
 
 function triggerRoutine(id) {
   apiFetch('/api/routines/' + id + '/trigger', { method: 'POST' })
-    .then(() => showToast('Routine triggered', 'success'))
+    .then(() => {
+      showToast('Routine triggered', 'success');
+      if (currentRoutineId === id) openRoutineDetail(id);
+      else loadRoutines();
+    })
     .catch((err) => showToast('Trigger failed: ' + err.message, 'error'));
 }
 
@@ -2981,6 +3293,12 @@ function fetchGatewayStatus() {
   apiFetch('/api/gateway/status').then(function(data) {
     var popover = document.getElementById('gateway-popover');
     var html = '';
+
+    // Version
+    if (data.version) {
+      html += '<div class="gw-section-label">IronClaw v' + escapeHtml(data.version) + '</div>';
+      html += '<div class="gw-divider"></div>';
+    }
 
     // Connection info
     html += '<div class="gw-section-label">Connections</div>';
@@ -3450,7 +3768,7 @@ function formatTimeAgo(epochMs) {
 }
 
 function installSkill(nameOrSlug, url, btn) {
-  var body = { name: nameOrSlug };
+  var body = { name: nameOrSlug, slug: nameOrSlug };
   if (url) body.url = url;
 
   apiFetch('/api/skills/install', {
@@ -3541,8 +3859,13 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  // Escape: close job detail or blur input
+  // Escape: close autocomplete, job detail, or blur input
   if (e.key === 'Escape') {
+    const acEl = document.getElementById('slash-autocomplete');
+    if (acEl && acEl.style.display !== 'none') {
+      hideSlashAutocomplete();
+      return;
+    }
     if (currentJobId) {
       closeJobDetail();
     } else if (inInput) {

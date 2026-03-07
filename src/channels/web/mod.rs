@@ -21,6 +21,7 @@ pub mod openai_compat;
 pub mod server;
 pub mod sse;
 pub mod types;
+pub(crate) mod util;
 pub mod ws;
 
 use std::net::SocketAddr;
@@ -62,13 +63,11 @@ impl GatewayChannel {
     /// If no auth token is configured, generates a random one and prints it.
     pub fn new(config: GatewayConfig) -> Self {
         let auth_token = config.auth_token.clone().unwrap_or_else(|| {
-            use rand::Rng;
-            let token: String = rand::thread_rng()
-                .sample_iter(&rand::distributions::Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect();
-            token
+            use rand::RngCore;
+            use rand::rngs::OsRng;
+            let mut bytes = [0u8; 32];
+            OsRng.fill_bytes(&mut bytes);
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
         });
 
         let state = Arc::new(GatewayState {
@@ -83,6 +82,7 @@ impl GatewayChannel {
             store: None,
             job_manager: None,
             prompt_queue: None,
+            scheduler: None,
             user_id: config.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
@@ -93,7 +93,6 @@ impl GatewayChannel {
             registry_entries: Vec::new(),
             cost_guard: None,
             startup_time: std::time::Instant::now(),
-            restart_requested: std::sync::atomic::AtomicBool::new(false),
         });
 
         Self {
@@ -107,7 +106,8 @@ impl GatewayChannel {
     fn rebuild_state(&mut self, mutate: impl FnOnce(&mut GatewayState)) {
         let mut new_state = GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
-            sse: SseManager::new(),
+            // Preserve the existing broadcast channel so sender handles remain valid.
+            sse: SseManager::from_sender(self.state.sse.sender()),
             workspace: self.state.workspace.clone(),
             session_manager: self.state.session_manager.clone(),
             log_broadcaster: self.state.log_broadcaster.clone(),
@@ -117,6 +117,7 @@ impl GatewayChannel {
             store: self.state.store.clone(),
             job_manager: self.state.job_manager.clone(),
             prompt_queue: self.state.prompt_queue.clone(),
+            scheduler: self.state.scheduler.clone(),
             user_id: self.state.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
@@ -127,7 +128,6 @@ impl GatewayChannel {
             registry_entries: self.state.registry_entries.clone(),
             cost_guard: self.state.cost_guard.clone(),
             startup_time: self.state.startup_time,
-            restart_requested: std::sync::atomic::AtomicBool::new(false),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -194,6 +194,12 @@ impl GatewayChannel {
         >,
     ) -> Self {
         self.rebuild_state(|s| s.prompt_queue = Some(pq));
+        self
+    }
+
+    /// Inject the scheduler for sending follow-up messages to agent jobs.
+    pub fn with_scheduler(mut self, slot: crate::tools::builtin::SchedulerSlot) -> Self {
+        self.rebuild_state(|s| s.scheduler = Some(slot));
         self
     }
 
@@ -296,9 +302,16 @@ impl Channel for GatewayChannel {
                 name,
                 thread_id: thread_id.clone(),
             },
-            StatusUpdate::ToolCompleted { name, success } => SseEvent::ToolCompleted {
+            StatusUpdate::ToolCompleted {
                 name,
                 success,
+                error,
+                parameters,
+            } => SseEvent::ToolCompleted {
+                name,
+                success,
+                error,
+                parameters,
                 thread_id: thread_id.clone(),
             },
             StatusUpdate::ToolResult { name, preview } => SseEvent::ToolResult {

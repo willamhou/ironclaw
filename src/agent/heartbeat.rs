@@ -164,6 +164,7 @@ impl HeartbeatRunner {
                 if report.had_work() {
                     tracing::info!(
                         daily_logs_deleted = report.daily_logs_deleted,
+                        conversation_docs_deleted = report.conversation_docs_deleted,
                         "heartbeat: memory hygiene deleted stale documents"
                     );
                 }
@@ -294,6 +295,7 @@ impl HeartbeatRunner {
         let response = OutgoingResponse {
             content: format!("🔔 *Heartbeat Alert*\n\n{}", message),
             thread_id: None,
+            attachments: Vec::new(),
             metadata: serde_json::json!({
                 "source": "heartbeat",
             }),

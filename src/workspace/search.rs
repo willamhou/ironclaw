@@ -81,6 +81,8 @@ impl SearchConfig {
 pub struct SearchResult {
     /// Document ID containing this chunk.
     pub document_id: Uuid,
+    /// File path of the source document.
+    pub document_path: String,
     /// Chunk ID.
     pub chunk_id: Uuid,
     /// Chunk content.
@@ -115,6 +117,8 @@ impl SearchResult {
 pub struct RankedResult {
     pub chunk_id: Uuid,
     pub document_id: Uuid,
+    /// File path of the source document.
+    pub document_path: String,
     pub content: String,
     pub rank: u32, // 1-based rank
 }
@@ -143,6 +147,7 @@ pub fn reciprocal_rank_fusion(
     // Track scores and metadata for each chunk
     struct ChunkInfo {
         document_id: Uuid,
+        document_path: String,
         content: String,
         score: f32,
         fts_rank: Option<u32>,
@@ -162,6 +167,7 @@ pub fn reciprocal_rank_fusion(
             })
             .or_insert(ChunkInfo {
                 document_id: result.document_id,
+                document_path: result.document_path,
                 content: result.content,
                 score: rrf_score,
                 fts_rank: Some(result.rank),
@@ -180,6 +186,7 @@ pub fn reciprocal_rank_fusion(
             })
             .or_insert(ChunkInfo {
                 document_id: result.document_id,
+                document_path: result.document_path,
                 content: result.content,
                 score: rrf_score,
                 fts_rank: None,
@@ -192,6 +199,7 @@ pub fn reciprocal_rank_fusion(
         .into_iter()
         .map(|(chunk_id, info)| SearchResult {
             document_id: info.document_id,
+            document_path: info.document_path,
             chunk_id,
             content: info.content,
             score: info.score,
@@ -235,9 +243,71 @@ mod tests {
         RankedResult {
             chunk_id,
             document_id: doc_id,
+            document_path: format!("docs/{}.md", doc_id),
             content: format!("content for chunk {}", chunk_id),
             rank,
         }
+    }
+
+    fn make_result_with_path(chunk_id: Uuid, doc_id: Uuid, path: &str, rank: u32) -> RankedResult {
+        RankedResult {
+            chunk_id,
+            document_id: doc_id,
+            document_path: path.to_string(),
+            content: format!("content for chunk {}", chunk_id),
+            rank,
+        }
+    }
+
+    #[test]
+    fn test_rrf_propagates_document_path() {
+        // Regression test: search results must carry the source document's
+        // file path, not the document UUID. See PR #503 / issue #481.
+        let config = SearchConfig::default().with_limit(10);
+
+        let doc_a = Uuid::new_v4();
+        let doc_b = Uuid::new_v4();
+        let chunk1 = Uuid::new_v4();
+        let chunk2 = Uuid::new_v4();
+        let chunk3 = Uuid::new_v4();
+
+        let fts_results = vec![
+            make_result_with_path(chunk1, doc_a, "notes/todo.md", 1),
+            make_result_with_path(chunk2, doc_b, "journal/2024-01-15.md", 2),
+        ];
+        let vector_results = vec![
+            make_result_with_path(chunk1, doc_a, "notes/todo.md", 1),
+            make_result_with_path(chunk3, doc_b, "journal/2024-01-15.md", 2),
+        ];
+
+        let results = reciprocal_rank_fusion(fts_results, vector_results, &config);
+
+        for result in &results {
+            // The path must be a real file path, never a UUID string
+            assert!(
+                Uuid::parse_str(&result.document_path).is_err(),
+                "document_path looks like a UUID ('{}'), expected a file path",
+                result.document_path
+            );
+        }
+
+        // Verify exact paths are preserved
+        let paths: Vec<&str> = results.iter().map(|r| r.document_path.as_str()).collect();
+        assert!(
+            paths.contains(&"notes/todo.md"),
+            "missing notes/todo.md in {:?}",
+            paths
+        );
+        assert!(
+            paths.contains(&"journal/2024-01-15.md"),
+            "missing journal/2024-01-15.md in {:?}",
+            paths
+        );
+
+        // Hybrid match (chunk1) should preserve the correct path
+        let hybrid = results.iter().find(|r| r.chunk_id == chunk1).unwrap();
+        assert_eq!(hybrid.document_path, "notes/todo.md");
+        assert!(hybrid.is_hybrid());
     }
 
     #[test]

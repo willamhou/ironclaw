@@ -694,17 +694,15 @@ impl<'de> Deserialize<'de> for MessageContent {
         let val = Value::deserialize(deserializer)?;
         match val {
             Value::String(s) => Ok(MessageContent::Text(s)),
-            Value::Array(_) => Ok(MessageContent::Text(
+            Value::Array(arr) => Ok(MessageContent::Text(
                 // For deserialization (responses), we only need the text content
-                val.as_array()
-                    .and_then(|arr| {
-                        arr.iter().find_map(|v| {
-                            if v.get("type")?.as_str()? == "text" {
-                                v.get("text")?.as_str().map(String::from)
-                            } else {
-                                None
-                            }
-                        })
+                arr.iter()
+                    .find_map(|v| {
+                        if v.get("type")?.as_str()? == "text" {
+                            v.get("text")?.as_str().map(String::from)
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or_default(),
             )),

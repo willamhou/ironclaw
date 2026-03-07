@@ -81,7 +81,7 @@ mod attachment_tests {
         assert!(
             last_user_msg.content.contains("<attachments>"),
             "user message should contain <attachments> block, got: {}",
-            &last_user_msg.content[..last_user_msg.content.len().min(200)]
+            last_user_msg.content.chars().take(200).collect::<String>()
         );
         assert!(
             last_user_msg

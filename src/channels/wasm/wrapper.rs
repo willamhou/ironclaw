@@ -3000,7 +3000,7 @@ fn read_attachments(paths: &[String]) -> Result<Vec<wit_channel::Attachment>, St
         // Validate paths are under /tmp/ or ~/.ironclaw/ to prevent arbitrary file reads
         let validated = crate::tools::builtin::path_utils::validate_path(path, Some(tmp_base))
             .or_else(|_| crate::tools::builtin::path_utils::validate_path(path, Some(&home_base)));
-        validated.map_err(|e| {
+        let validated = validated.map_err(|e| {
             format!(
                 "Invalid attachment path '{}': must be under /tmp/ or ~/.ironclaw/: {}",
                 path, e
@@ -3008,8 +3008,8 @@ fn read_attachments(paths: &[String]) -> Result<Vec<wit_channel::Attachment>, St
         })?;
 
         // Pre-check file size before reading into memory to avoid OOM
-        let file_size = std::fs::metadata(path)
-            .map_err(|e| format!("Failed to stat attachment '{}': {}", path, e))?
+        let file_size = std::fs::metadata(&validated)
+            .map_err(|e| format!("Failed to stat attachment '{}': {}", validated.display(), e))?
             .len();
         total_bytes += file_size;
         if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
@@ -3019,10 +3019,10 @@ fn read_attachments(paths: &[String]) -> Result<Vec<wit_channel::Attachment>, St
             ));
         }
 
-        let data = std::fs::read(path)
-            .map_err(|e| format!("Failed to read attachment '{}': {}", path, e))?;
+        let data = std::fs::read(&validated)
+            .map_err(|e| format!("Failed to read attachment '{}': {}", validated.display(), e))?;
 
-        let filename = std::path::Path::new(path)
+        let filename = validated
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file")

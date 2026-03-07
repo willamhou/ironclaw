@@ -124,8 +124,13 @@ fn format_attachment(index: usize, att: &IncomingAttachment) -> String {
                 }
             };
 
+            let size_attr = att
+                .size_bytes
+                .map(|s| format!(" size=\"{}\"", format_size(s)))
+                .unwrap_or_default();
+
             format!(
-                "<attachment index=\"{index}\" type=\"document\" filename=\"{filename}\">\n\
+                "<attachment index=\"{index}\" type=\"document\" filename=\"{filename}\" mime=\"{mime}\"{size_attr}>\n\
                  {body}\n\
                  </attachment>"
             )

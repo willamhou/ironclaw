@@ -306,6 +306,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let mut iteration = 0;
         const MAX_CONSECUTIVE_RATE_LIMITS: usize = 10;
         let mut consecutive_rate_limits = 0usize;
+        const MAX_TOOL_INTENT_NUDGES: u32 = 2;
+        let mut consecutive_tool_intent_nudges: u32 = 0;
 
         // Initial tool definitions for planning (will be refreshed in loop)
         reason_ctx.available_tools = self.tools().tool_definitions().await;
@@ -503,17 +505,34 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             }),
                         );
 
-                        // Give it one more chance to select a tool
-                        if iteration > 3 && iteration % 5 == 0 {
-                            reason_ctx.messages.push(ChatMessage::user(
-                                "Are you stuck? Do you need help completing this job?",
-                            ));
+                        // Nudge the LLM if it expressed tool intent without calling tools
+                        let signals_intent = !reason_ctx.available_tools.is_empty()
+                            && crate::llm::llm_signals_tool_intent(&response);
+                        if signals_intent && consecutive_tool_intent_nudges < MAX_TOOL_INTENT_NUDGES
+                        {
+                            consecutive_tool_intent_nudges += 1;
+                            tracing::info!(
+                                job_id = %self.job_id,
+                                "LLM expressed tool intent without calling a tool, nudging"
+                            );
+                            reason_ctx
+                                .messages
+                                .push(ChatMessage::user(crate::llm::TOOL_INTENT_NUDGE));
+                        } else if !signals_intent {
+                            consecutive_tool_intent_nudges = 0;
+                            if iteration > 3 && iteration % 5 == 0 {
+                                // Generic fallback nudge
+                                reason_ctx.messages.push(ChatMessage::user(
+                                    "Are you stuck? Do you need help completing this job?",
+                                ));
+                            }
                         }
                     }
                     RespondResult::ToolCalls {
                         tool_calls,
                         content,
                     } => {
+                        consecutive_tool_intent_nudges = 0;
                         // Model returned tool calls - execute them
                         tracing::debug!(
                             "Job {} respond_with_tools returned {} tool calls",
@@ -559,6 +578,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     }
                 }
             } else {
+                consecutive_tool_intent_nudges = 0;
+
                 // Record the assistant tool_calls message so that tool_result
                 // messages have a matching parent (prevents orphaned rewrites).
                 let tool_calls: Vec<ToolCall> = selections

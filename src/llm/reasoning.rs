@@ -2331,9 +2331,11 @@ That's my plan."#;
         // '🔥' is 4 bytes (F0 9F 94 A5). Passing pos=1 lands inside the char.
         // line_bounds must not panic — it should snap to a valid boundary.
         let text = "🔥\n<tool_call>";
-        let _ = line_bounds(text, 1); // would panic before fix
-        let _ = line_bounds(text, 2);
-        let _ = line_bounds(text, 3);
+        // All mid-char positions should snap back to byte 0 (start of '🔥'),
+        // so line bounds cover the first line: "🔥" = bytes 0..4.
+        assert_eq!(line_bounds(text, 1), (0, 4)); // would panic before fix
+        assert_eq!(line_bounds(text, 2), (0, 4));
+        assert_eq!(line_bounds(text, 3), (0, 4));
     }
 
     #[test]
@@ -2342,8 +2344,9 @@ That's my plan."#;
         // should not panic even with multi-byte chars on the same line.
         let text = "Result: 🔥\n<tool_call>";
         let newline_pos = text.find('\n').unwrap();
-        // saturating_sub(1) lands inside '🔥' (byte 11 → 10, but char ends at 12)
-        let _ = line_bounds(text, newline_pos.saturating_sub(1));
+        // saturating_sub(1) lands inside '🔥' (byte 11 → 10, but char ends at 12).
+        // Snaps back to byte 8 (start of '🔥'), line covers "Result: 🔥" = bytes 0..12.
+        assert_eq!(line_bounds(text, newline_pos.saturating_sub(1)), (0, 12));
     }
 
     #[test]

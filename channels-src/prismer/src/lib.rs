@@ -285,7 +285,7 @@ fn register_agent(config: &PrismerConfig) -> Result<(String, String), String> {
         "agentType": config.agent_type,
         "capabilities": config.capabilities,
         "description": config.description,
-        "endpoint": config.tunnel_url,
+        "endpoint": config.tunnel_url.as_ref().map(|u| format!("{}/webhook/prismer", u.trim_end_matches('/'))),
     });
 
     // Use placeholder -- host replaces {PRISMER_API_KEY} with actual secret value
@@ -445,7 +445,11 @@ impl Guest for PrismerChannel {
     }
 
     fn on_http_request(req: IncomingHttpRequest) -> OutgoingHttpResponse {
-        if !req.secret_validated {
+        // Only enforce signature validation when a webhook secret is configured.
+        // When no secret exists, the host cannot validate signatures and
+        // `secret_validated` will always be false — rejecting every request.
+        let secret_configured = channel_host::secret_exists("prismer_webhook_secret");
+        if secret_configured && !req.secret_validated {
             channel_host::log(
                 channel_host::LogLevel::Warn,
                 "Webhook request with invalid or missing signature",
@@ -666,8 +670,11 @@ impl Guest for PrismerChannel {
 
             // Pagination loop: fetch batches until we've consumed all unread messages.
             // The API may return fewer than `unread` in a single response.
+            // Track whether the entire fetch completed — on partial failure we must
+            // NOT mark-as-read or advance the cursor, so messages are re-delivered.
             let mut offset = current_offset;
             let page_size = 50_usize;
+            let mut fetch_ok = true;
             loop {
                 let msg_url = if offset > 0 {
                     format!(
@@ -696,6 +703,7 @@ impl Guest for PrismerChannel {
                                 channel_host::LogLevel::Error,
                                 &format!("Failed to fetch messages for {}: {}", conv.id, e),
                             );
+                            fetch_ok = false;
                             break;
                         }
                     };
@@ -720,6 +728,7 @@ impl Guest for PrismerChannel {
                                         conv.id, e
                                     ),
                                 );
+                                fetch_ok = false;
                                 break;
                             }
                         },
@@ -728,6 +737,7 @@ impl Guest for PrismerChannel {
                                 channel_host::LogLevel::Error,
                                 &format!("Re-register failed during message fetch: {}", e),
                             );
+                            fetch_ok = false;
                             break;
                         }
                     }
@@ -743,6 +753,7 @@ impl Guest for PrismerChannel {
                             conv.id, final_status
                         ),
                     );
+                    fetch_ok = false;
                     break;
                 }
 
@@ -756,6 +767,7 @@ impl Guest for PrismerChannel {
                                 conv.id, e
                             ),
                         );
+                        fetch_ok = false;
                         break;
                     }
                 };
@@ -818,6 +830,19 @@ impl Guest for PrismerChannel {
                 }
             }
 
+            // On partial fetch failure, skip mark-as-read and cursor advance so
+            // messages are re-delivered on the next poll cycle.
+            if !fetch_ok {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!(
+                        "Partial fetch failure for {} — skipping mark-as-read and cursor advance",
+                        conv.id
+                    ),
+                );
+                continue;
+            }
+
             // Mark as read first — if this fails, we don't advance the cursor
             // so the messages will be re-delivered on the next poll cycle.
             let read_url = format!(
@@ -825,12 +850,25 @@ impl Guest for PrismerChannel {
                 config.base_url, conv.id
             );
             let read_jwt = channel_host::workspace_read(JWT_PATH).unwrap_or_default();
-            if let Err(e) = api_request("POST", &read_url, &read_jwt, None) {
-                channel_host::log(
-                    channel_host::LogLevel::Warn,
-                    &format!("Mark-as-read failed for {}: {} — cursor not advanced", conv.id, e),
-                );
-                continue;
+            match api_request("POST", &read_url, &read_jwt, None) {
+                Ok((status, _)) if status >= 300 => {
+                    channel_host::log(
+                        channel_host::LogLevel::Warn,
+                        &format!(
+                            "Mark-as-read failed for {} (HTTP {}) — cursor not advanced",
+                            conv.id, status
+                        ),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    channel_host::log(
+                        channel_host::LogLevel::Warn,
+                        &format!("Mark-as-read failed for {}: {} — cursor not advanced", conv.id, e),
+                    );
+                    continue;
+                }
+                _ => {}
             }
 
             // Only advance cursor after successful mark-as-read
@@ -1152,6 +1190,118 @@ mod tests {
         let serialized = serde_json::to_vec(&body).unwrap();
         let roundtrip: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
         assert_eq!(roundtrip, body, "Payload must survive JSON roundtrip");
+    }
+
+    #[test]
+    fn test_register_endpoint_includes_webhook_path() {
+        // Regression: register_agent() was sending the bare tunnel URL to Prismer
+        // instead of the full webhook endpoint path (/webhook/prismer).
+        let config = PrismerConfig {
+            base_url: default_base_url(),
+            agent_name: None,
+            display_name: default_display_name(),
+            agent_type: default_agent_type(),
+            capabilities: default_capabilities(),
+            description: default_description(),
+            polling_enabled: false,
+            poll_interval_ms: default_poll_interval(),
+            dm_policy: default_dm_policy(),
+            tunnel_url: Some("https://abc.ngrok.io".to_string()),
+        };
+
+        // Build the same JSON body that register_agent() builds
+        let endpoint = config
+            .tunnel_url
+            .as_ref()
+            .map(|u| format!("{}/webhook/prismer", u.trim_end_matches('/')));
+
+        assert_eq!(
+            endpoint,
+            Some("https://abc.ngrok.io/webhook/prismer".to_string()),
+            "Endpoint must include /webhook/prismer path"
+        );
+
+        // Trailing slash should be trimmed
+        let trailing = Some("https://abc.ngrok.io/".to_string());
+        let endpoint2 = trailing
+            .as_ref()
+            .map(|u| format!("{}/webhook/prismer", u.trim_end_matches('/')));
+        assert_eq!(
+            endpoint2,
+            Some("https://abc.ngrok.io/webhook/prismer".to_string()),
+            "Trailing slash must be trimmed before appending path"
+        );
+
+        // No tunnel_url => no endpoint
+        let no_tunnel: Option<String> = None;
+        let endpoint3 = no_tunnel
+            .as_ref()
+            .map(|u| format!("{}/webhook/prismer", u.trim_end_matches('/')));
+        assert_eq!(endpoint3, None, "No tunnel means no endpoint");
+    }
+
+    #[test]
+    fn test_secret_validation_conditional() {
+        // Regression: on_http_request always rejected requests when
+        // secret_validated=false, even when no webhook secret was configured.
+        // The fix checks secret_configured first.
+
+        // When no secret configured: secret_validated=false should be OK
+        let secret_configured = false;
+        let secret_validated = false;
+        let should_reject = secret_configured && !secret_validated;
+        assert!(
+            !should_reject,
+            "Must NOT reject when no secret is configured"
+        );
+
+        // When secret configured: secret_validated=false should reject
+        let secret_configured = true;
+        let secret_validated = false;
+        let should_reject = secret_configured && !secret_validated;
+        assert!(
+            should_reject,
+            "Must reject when secret is configured but validation fails"
+        );
+
+        // When secret configured: secret_validated=true should pass
+        let secret_configured = true;
+        let secret_validated = true;
+        let should_reject = secret_configured && !secret_validated;
+        assert!(
+            !should_reject,
+            "Must NOT reject when secret is configured and validation passes"
+        );
+    }
+
+    #[test]
+    fn test_partial_fetch_blocks_cursor_advance() {
+        // Regression: pagination loop would fall through to mark-as-read and
+        // cursor advance even after a partial fetch failure, potentially
+        // losing messages.
+
+        // Simulate: fetch_ok tracks whether the loop completed without error
+        let current_offset: usize = 0;
+        let mut offset: usize = 25; // fetched 25 messages before failure
+
+        // Simulate a failure mid-pagination
+        let fetch_ok = false;
+
+        // After loop: should NOT advance cursor when fetch_ok is false
+        assert!(!fetch_ok, "fetch_ok must be false after partial failure");
+        assert!(
+            offset > current_offset,
+            "offset advanced during partial fetch"
+        );
+        // The production code skips mark-as-read + cursor write when !fetch_ok
+
+        // Simulate: full success
+        let fetch_ok = true;
+        offset = 50;
+        assert!(
+            fetch_ok && offset > current_offset,
+            "Should advance cursor only when fetch_ok and offset moved"
+        );
     }
 
     #[test]

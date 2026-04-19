@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
+use ironclaw_common::ExtensionName;
+
 use crate::bootstrap::ironclaw_base_dir;
 use crate::tools::mcp::McpTool;
 use crate::tools::tool::ToolError;
@@ -159,31 +161,14 @@ impl McpServerConfig {
 
     /// Validate the server configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.name.is_empty() {
-            return Err(ConfigError::InvalidConfig {
-                reason: "Server name cannot be empty".to_string(),
-            });
-        }
-
-        // Allowlist: lowercase alphanumeric, dash, underscore.
-        // Uppercase is rejected because canonicalize_extension_name()
-        // (extensions/naming.rs) only accepts lowercase — uppercase names
-        // pass validation but are silently dropped at runtime.
-        // Also rejects shell metacharacters (;|&`$), path separators (/\),
-        // dots, null bytes, spaces, and other dangerous characters.
-        if !self
-            .name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-        {
-            return Err(ConfigError::InvalidConfig {
-                reason: format!(
-                    "Server name '{}' contains invalid characters \
-                     (only lowercase alphanumeric, dash, underscore are allowed)",
-                    self.name
-                ),
-            });
-        }
+        // Delegate name validation to the canonical identity validator.
+        // This is the single source of truth for extension/server names and
+        // catches: empty, too-long (>64), uppercase, path traversal,
+        // leading/trailing separator, consecutive underscores/dashes,
+        // shell metacharacters, dots, null bytes, spaces, etc.
+        ExtensionName::new(&self.name).map_err(|e| ConfigError::InvalidConfig {
+            reason: format!("Invalid server name '{}': {e}", self.name),
+        })?;
 
         match self.effective_transport() {
             EffectiveTransport::Http => {
@@ -1196,8 +1181,8 @@ mod tests {
 
     #[test]
     fn test_server_name_uppercase_rejected() {
-        // Uppercase is rejected because canonicalize_extension_name() only
-        // accepts lowercase — uppercase names pass here but are silently
+        // Uppercase is rejected because the canonical name validator
+        // only accepts lowercase — uppercase names would be silently
         // dropped at runtime by the extension manager.
         for name in ["MCP-1", "MyServer", "Notion"] {
             let config = McpServerConfig::new(name, "https://mcp.example.com");
@@ -1207,6 +1192,63 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_server_name_leading_trailing_separator_rejected() {
+        // Catches edge cases the old manual allowlist missed
+        for name in ["-server", "server-", "_server", "server_"] {
+            let config = McpServerConfig::new(name, "https://mcp.example.com");
+            assert!(
+                config.validate().is_err(),
+                "Name '{}' with leading/trailing separator should be rejected",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_server_name_consecutive_separators_rejected() {
+        for name in ["my--server", "my__server"] {
+            let config = McpServerConfig::new(name, "https://mcp.example.com");
+            assert!(
+                config.validate().is_err(),
+                "Name '{}' with consecutive separators should be rejected",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_server_name_bare_separator_rejected() {
+        for name in ["-", "_"] {
+            let config = McpServerConfig::new(name, "https://mcp.example.com");
+            assert!(
+                config.validate().is_err(),
+                "Bare separator '{}' should be rejected",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_server_name_64_chars_accepted() {
+        let name = "a".repeat(64);
+        let config = McpServerConfig::new(&name, "https://mcp.example.com");
+        assert!(
+            config.validate().is_ok(),
+            "64-char name should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_server_name_65_chars_rejected() {
+        let name = "a".repeat(65);
+        let config = McpServerConfig::new(&name, "https://mcp.example.com");
+        assert!(
+            config.validate().is_err(),
+            "65-char name should be rejected (max is 64)"
+        );
     }
 
     #[tokio::test]

@@ -3780,11 +3780,7 @@ impl ExtensionManager {
         // surfaces "Invalid URL: relative URL without a base". Fixes
         // nearai/ironclaw#2923.
         if !server.requires_auth() {
-            return Ok(AuthResult {
-                name: name.to_string(),
-                kind: ExtensionKind::McpServer,
-                status: crate::extensions::AuthStatus::NoAuthRequired,
-            });
+            return Ok(AuthResult::no_auth_required(name, ExtensionKind::McpServer));
         }
 
         // In gateway mode, build an auth URL and return it for the frontend to

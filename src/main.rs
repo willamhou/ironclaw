@@ -1254,6 +1254,7 @@ async fn async_main() -> anyhow::Result<()> {
         cost_guard: components.cost_guard,
         sse_tx: sse_manager,
         http_interceptor,
+        signing: components.signing.clone(),
         transcription: config.transcription.create_provider().map(|p| {
             Arc::new(ironclaw::llm::transcription::TranscriptionMiddleware::new(
                 p,
